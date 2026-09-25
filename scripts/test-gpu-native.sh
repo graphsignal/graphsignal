@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 export PATH="/usr/local/cuda/bin:$PATH"
 
 echo "--> pure C++ tests (probe, common)"
-make -f Makefile.cupti test-probe test-common
+make -f Makefile.cupti test-probe test-common test-discovery
 
 if command -v nvcc >/dev/null 2>&1; then
   cuda_release=$(nvcc --version | grep -o 'release [0-9]*\.[0-9]*' | awk '{print $2}')

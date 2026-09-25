@@ -35,6 +35,9 @@
 #include <vector>
 
 #include <fcntl.h>
+#if defined(__linux__)
+#include <link.h>
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -498,12 +501,103 @@ class MetricsWriter {
     }
   }
 
+  // A process can hold two registries: the one shared libraries unify on
+  // (found by dlsym), and the main executable's own copy, which an executable
+  // exports only when linked with -rdynamic. Both are serialized.
+  void serialize_probes(std::string& j, bool& first_metric) {
+    graphsignal_probe_registry* regs[2] = {graphsignal_probe_reader_attach(),
+                                           find_executable_registry()};
+    if (regs[1] == regs[0]) regs[1] = nullptr;
+    uint64_t probe_dropped = 0;
+    for (graphsignal_probe_registry* reg : regs) {
+      if (!reg) continue;
+      serialize_registry(reg, j, first_metric);
+      probe_dropped += __atomic_load_n(&reg->dropped, __ATOMIC_RELAXED);
+    }
+    if (probe_dropped > 0) {
+      if (!first_metric) j += ',';
+      first_metric = false;
+      serialize_metric_head(j, "graphsignal_probe_dropped_instruments", "counter");
+      j += ",\"tags\":{},\"value\":";
+      append_u64(j, probe_dropped);
+      j += '}';
+    }
+  }
+
+  // The main executable's registry when dlsym cannot see it (no -rdynamic):
+  // its writable segments are scanned for the registry header, the match is
+  // validated entry by entry before it is trusted, and the address is cached.
+  // Until a registry is found the scan repeats each write — it only reads the
+  // executable's own mapped data. Linux only.
+  graphsignal_probe_registry* find_executable_registry() {
+    graphsignal_probe_registry* cached = exe_registry_.load(std::memory_order_acquire);
+    if (cached) return cached;
+#if defined(__linux__)
+    // The callback runs under the loader lock: it only records the ranges,
+    // the scan happens after the lock is released.
+    struct Ranges {
+      bool main_seen = false;
+      size_t n = 0;
+      uintptr_t begin[16];
+      size_t size[16];
+    } ranges;
+    dl_iterate_phdr(
+        [](struct dl_phdr_info* info, size_t, void* arg) -> int {
+          Ranges* r = static_cast<Ranges*>(arg);
+          if (r->main_seen) return 1;  // the main program is reported first
+          r->main_seen = true;
+          for (int i = 0; i < info->dlpi_phnum && r->n < 16; i++) {
+            const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+            if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_W)) continue;
+            r->begin[r->n] = info->dlpi_addr + ph.p_vaddr;
+            r->size[r->n] = ph.p_memsz;
+            r->n++;
+          }
+          return 1;
+        },
+        &ranges);
+    graphsignal_probe_registry* found = nullptr;
+    for (size_t i = 0; i < ranges.n && !found; i++) {
+      found = scan_for_registry(ranges.begin[i], ranges.size[i]);
+    }
+    if (found) exe_registry_.store(found, std::memory_order_release);
+    return found;
+#else
+    return nullptr;
+#endif
+  }
+
+  static graphsignal_probe_registry* scan_for_registry(uintptr_t begin, size_t size) {
+    const size_t align = alignof(graphsignal_probe_registry);
+    uintptr_t p = (begin + align - 1) & ~(uintptr_t)(align - 1);
+    const uintptr_t end = begin + size;
+    for (; p + sizeof(graphsignal_probe_registry) <= end; p += align) {
+      const graphsignal_probe_registry* reg = reinterpret_cast<const graphsignal_probe_registry*>(p);
+      if (__atomic_load_n(&reg->magic, __ATOMIC_RELAXED) != GRAPHSIGNAL_PROBE_ABI_MAGIC) continue;
+      if (__atomic_load_n(&reg->abi_version, __ATOMIC_RELAXED) != GRAPHSIGNAL_PROBE_ABI_VERSION) continue;
+      if (registry_is_valid(reg)) return const_cast<graphsignal_probe_registry*>(reg);
+    }
+    return nullptr;
+  }
+
+  // A header match is trusted only if every published entry is well formed,
+  // so a stray match can never send the serializer through a bad pointer.
+  static bool registry_is_valid(const graphsignal_probe_registry* reg) {
+    const uint64_t count = graphsignal_probe_reader_count(reg);
+    if (count == 0 || count > GRAPHSIGNAL_PROBE_MAX_INSTRUMENTS) return false;
+    for (uint64_t i = 0; i < count; i++) {
+      const graphsignal_probe_entry* e = &reg->entries[i];
+      if (e->type > GRAPHSIGNAL_PROFILE || e->storage > GRAPHSIGNAL_STORAGE_DEVICE) return false;
+      if (e->ntags > GRAPHSIGNAL_PROBE_MAX_TAGS || !e->data) return false;
+      if (e->storage == GRAPHSIGNAL_STORAGE_HOST && e->device_id != -1) return false;
+      if (!e->name[0] || !memchr(e->name, '\0', sizeof(e->name))) return false;
+    }
+    return true;
+  }
+
   // Device probes are copied in one platform reader call per write; a probe
   // whose copy failed is skipped for this write.
-  void serialize_probes(std::string& j, bool& first_metric) {
-    graphsignal_probe_registry* reg = graphsignal_probe_reader_attach();
-    if (!reg) return;
-
+  void serialize_registry(graphsignal_probe_registry* reg, std::string& j, bool& first_metric) {
     DeviceProbeReader device_reader = nullptr;
     void* device_reader_arg = nullptr;
     {
@@ -576,16 +670,6 @@ class MetricsWriter {
           serialize_bins(j, snap.bins);
           serialize_hist_aggregates(j, snap.count, snap.sum, snap.min, snap.max);
       }
-      j += '}';
-    }
-
-    uint64_t probe_dropped = __atomic_load_n(&reg->dropped, __ATOMIC_RELAXED);
-    if (probe_dropped > 0) {
-      if (!first_metric) j += ',';
-      first_metric = false;
-      serialize_metric_head(j, "graphsignal_probe_dropped_instruments", "counter");
-      j += ",\"tags\":{},\"value\":";
-      append_u64(j, probe_dropped);
       j += '}';
     }
   }
@@ -784,6 +868,7 @@ class MetricsWriter {
   void* flush_arg_ = nullptr;
   DeviceProbeReader device_reader_ = nullptr;
   void* device_reader_arg_ = nullptr;
+  std::atomic<graphsignal_probe_registry*> exe_registry_{nullptr};
 
   std::mutex log_mu_;
   std::vector<LogEntry> log_ring_;

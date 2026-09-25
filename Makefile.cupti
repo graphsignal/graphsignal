@@ -64,6 +64,11 @@ TEST_PROBE_OUT := $(BUILD_DIR)/probe_test
 TEST_COMMON_SRC := src/test/common/common_test.cpp
 TEST_COMMON_OUT := $(BUILD_DIR)/common_test
 
+TEST_DISCOVERY_SRC := src/test/discovery/discovery_test.cpp
+TEST_DISCOVERY_LIB_SRC := src/test/discovery/discovery_lib.cpp
+TEST_DISCOVERY_OUT := $(BUILD_DIR)/discovery_test
+TEST_DISCOVERY_LIB := $(BUILD_DIR)/libdiscovery_lib.so
+
 TEST_CUPTI_TEST_SRC := src/test/cupti/cupti_activity_test.cpp
 TEST_CUPTI_OUT := $(BUILD_DIR)/cupti_activity_test
 TEST_CUPTI_TEST_OBJ := $(BUILD_DIR)/cupti_activity_test.o
@@ -110,12 +115,12 @@ BUILDX_OUT_DIR ?= dist/cupti
 CUDA12_VERSION ?= 12.4.1
 CUDA13_VERSION ?= 13.0.0
 
-.PHONY: all cupti cupti-install test test-probe test-common test-cupti-activity clean distclean info \
+.PHONY: all cupti cupti-install test test-probe test-common test-discovery test-cupti-activity clean distclean info \
 	buildx-setup cupti-buildx cupti-buildx-cu12 cupti-buildx-cu13 cupti-buildx-install
 
 all: cupti
 
-test: test-probe test-common test-cupti-activity
+test: test-probe test-common test-discovery test-cupti-activity
 
 info:
 	@echo "UNAME_S=$(UNAME_S)"
@@ -234,6 +239,22 @@ test-probe: $(TEST_PROBE_OUT)
 $(TEST_PROBE_OUT): $(TEST_PROBE_SRC) | $(BUILD_DIR)
 	@echo "Building test: $@"
 	$(CXX) -std=c++17 -Iinclude -pthread -o "$@" $(TEST_PROBE_SRC) -ldl
+
+# test-discovery: probes in an executable linked WITHOUT -rdynamic must still
+# be found by a writer loaded from a separate RTLD_LOCAL shared object. Linux
+# only (dl_iterate_phdr); pure C++, no GPU.
+test-discovery:
+	@if [[ "$(UNAME_S)" != "Linux" ]]; then echo "Skipping discovery test (Linux only)."; exit 0; fi; \
+	$(MAKE) -f Makefile.cupti $(TEST_DISCOVERY_OUT) $(TEST_DISCOVERY_LIB) && \
+	echo "Running test: $(TEST_DISCOVERY_OUT)" && \
+	./$(TEST_DISCOVERY_OUT) $(TEST_DISCOVERY_LIB)
+
+$(TEST_DISCOVERY_LIB): $(TEST_DISCOVERY_LIB_SRC) src/common/metrics_writer.h include/graphsignal/probe.h | $(BUILD_DIR)
+	$(CXX) -std=c++17 -fPIC -shared -Iinclude -Isrc/common -pthread -o "$@" $(TEST_DISCOVERY_LIB_SRC) -ldl
+
+# Deliberately no -rdynamic: the executable must not export its registry.
+$(TEST_DISCOVERY_OUT): $(TEST_DISCOVERY_SRC) include/graphsignal/probe.h | $(BUILD_DIR)
+	$(CXX) -std=c++17 -Iinclude -pthread -o "$@" $(TEST_DISCOVERY_SRC) -ldl
 
 test-common: $(TEST_COMMON_OUT)
 	@echo "Running test: $(TEST_COMMON_OUT)"
