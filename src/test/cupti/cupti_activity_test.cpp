@@ -459,9 +459,124 @@ static void run_graph_trace_child(const char* env_value) {
   ASSERT_EQ(WEXITSTATUS(status), 0, "graph-trace child must exit 0");
 }
 
+// ---------------------------------------------------------------------------
+// Device probes vs. CUDA graph capture. Engines (vLLM, SGLang) capture graphs
+// in cudaStreamCaptureModeGlobal, where a potentially unsafe CUDA call from ANY
+// thread invalidates the capture — the engine then fails at startup. Two paths
+// must never do that: the writer thread's device probe reader (runs every
+// interval, so it overlaps captures), and graphsignal_probe_register_cuda
+// called on the capturing thread mid-capture (lazy registration in a kernel
+// wrapper that first runs under capture). Re-exec'd child: its own CUPTI
+// session with a short interval so the reader overlaps every capture window.
+// ---------------------------------------------------------------------------
+
+static const char* kCaptureMarker = "--capture-scenario";
+static const int kCaptureRounds = 100;
+
+static int capture_scenario() {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    std::printf("capture child: CUDA not available, skipping\n");
+    return 0;
+  }
+  ASSERT(cudaSetDevice(0) == cudaSuccess, "capture child: cudaSetDevice failed");
+
+  // Registered before capture, so the reader copies it on every write.
+  graphsignal_probe_entry* pre = graphsignal_probe_register_cuda(
+      "capture_pre_duration", NULL, NULL, 0);
+  ASSERT(pre != nullptr, "capture child: pre-capture registration failed");
+
+  const uint64_t write_interval_ns = 1'000'000ULL;  // 1ms: overlap every capture
+  ASSERT(cupti_activity_start(write_interval_ns, /*debug_mode=*/0,
+                              GRAPHSIGNAL_GRAPH_TRACE_MODE_GRAPH) == 1,
+         "cupti_activity_start failed in capture child");
+
+  cudaStream_t s = nullptr;
+  ASSERT(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess,
+         "capture child: stream create failed");
+
+  // Phase A: the reader runs while captures are open.
+  // Phase B: a new device probe is registered on the capturing thread mid-capture.
+  int reader_failures = 0;
+  int register_failures = 0;
+  graphsignal_probe_entry* during = nullptr;
+  for (int round = 0; round < 2 * kCaptureRounds; ++round) {
+    const bool register_now = round >= kCaptureRounds;
+    ASSERT(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal) == cudaSuccess,
+           "capture child: begin capture failed");
+    probe_record_kernel<<<1, 32, 0, s>>>(graphsignal_probe_device_data(pre), 1000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));  // several writer ticks
+    if (register_now) {
+      during = graphsignal_probe_register_cuda("capture_during_duration", NULL, NULL, 0);
+      probe_record_kernel<<<1, 32, 0, s>>>(graphsignal_probe_device_data(during), 1000);
+    }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t rc = cudaStreamEndCapture(s, &graph);
+    if (rc != cudaSuccess) {
+      if (register_now) register_failures++; else reader_failures++;
+      if (reader_failures + register_failures <= 3) {
+        std::fprintf(stderr, "capture child: round %d capture failed: %s\n", round,
+                     cudaGetErrorString(rc));
+      }
+      if (graph) cudaGraphDestroy(graph);
+      cudaGetLastError();
+      continue;
+    }
+    cudaGraphExec_t exec = nullptr;
+    ASSERT(cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess,
+           "capture child: instantiate failed");
+    ASSERT(cudaGraphLaunch(exec, s) == cudaSuccess, "capture child: launch failed");
+    ASSERT(cudaStreamSynchronize(s) == cudaSuccess, "capture child: sync failed");
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+  }
+  std::printf("capture child: reader-overlap failures=%d, register-in-capture failures=%d\n",
+              reader_failures, register_failures);
+  ASSERT_EQ(reader_failures, 0, "device probe reader must never invalidate a capture");
+  ASSERT_EQ(register_failures, 0, "registration mid-capture must never invalidate it");
+  ASSERT(during != nullptr, "registration mid-capture must succeed");
+
+  // Both probes keep being read: every successful replay recorded once.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const std::string json = read_file(shm_json_path());
+  const auto pre_blocks = find_metric_blocks(json, "capture_pre_duration");
+  ASSERT(pre_blocks.size() == 1, "capture child: capture_pre_duration missing");
+  ASSERT_EQ(block_u64(pre_blocks[0], "count"), static_cast<uint64_t>(2 * kCaptureRounds),
+            "capture child: every replay must be recorded into the pre-capture probe");
+  const auto during_blocks = find_metric_blocks(json, "capture_during_duration");
+  ASSERT(during_blocks.size() == 1, "capture child: capture_during_duration missing");
+  ASSERT_EQ(block_u64(during_blocks[0], "count"), static_cast<uint64_t>(kCaptureRounds),
+            "capture child: every phase-B replay must be recorded");
+
+  cudaStreamDestroy(s);
+  cupti_activity_stop();
+  std::printf("capture child passed\n");
+  return 0;
+}
+
+static void run_capture_child() {
+  std::printf("--- capture child: device probes vs. global-mode graph capture\n");
+  pid_t pid = fork();
+  ASSERT(pid >= 0, "fork must succeed");
+  if (pid == 0) {
+    char arg0[] = "cupti_activity_test";
+    char arg1[] = "--capture-scenario";
+    char* const child_argv[] = {arg0, arg1, nullptr};
+    execv("/proc/self/exe", child_argv);
+    _exit(127);
+  }
+  int status = 0;
+  ASSERT(waitpid(pid, &status, 0) == pid, "waitpid must return the child");
+  ASSERT(WIFEXITED(status), "capture child must exit normally");
+  ASSERT_EQ(WEXITSTATUS(status), 0, "capture child must exit 0");
+}
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::strcmp(argv[1], kGraphTraceMarker) == 0) {
     return graph_trace_scenario();
+  }
+  if (argc > 1 && std::strcmp(argv[1], kCaptureMarker) == 0) {
+    return capture_scenario();
   }
 
   int device_count = 0;
@@ -479,6 +594,9 @@ int main(int argc, char** argv) {
   run_graph_trace_child(nullptr);   // default: GRAPH granularity
   run_graph_trace_child("node");    // opt-in: NODE granularity
   run_graph_trace_child("nodes");   // invalid: falls back to GRAPH
+
+  // Device probes must never break a workload's CUDA graph capture.
+  run_capture_child();
 
   // HOST-storage probe, registered before profiling starts. The writer reads
   // the registry on every serialize, so it appears in cupti.json.

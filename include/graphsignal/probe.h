@@ -228,13 +228,55 @@ static inline int graphsignal_probe__entry_matches(
     return 1;
 }
 
+static inline size_t graphsignal_probe__clamp_ntags(
+        const char* const* tag_keys, const char* const* tag_vals, size_t ntags) {
+    if (ntags > GRAPHSIGNAL_PROBE_MAX_TAGS) ntags = GRAPHSIGNAL_PROBE_MAX_TAGS;
+    if (ntags > 0 && (!tag_keys || !tag_vals)) ntags = 0;
+    return ntags;
+}
+
+/* Caller holds the registry lock. */
+static inline graphsignal_probe_entry* graphsignal_probe__find_locked(
+        graphsignal_probe_registry* reg, const char* name,
+        const char* const* tag_keys, const char* const* tag_vals, size_t ntags) {
+    for (uint64_t i = 0; i < reg->count; i++) {
+        if (graphsignal_probe__entry_matches(&reg->entries[i], name,
+                                             tag_keys, tag_vals, ntags)) {
+            return &reg->entries[i];
+        }
+    }
+    return NULL;
+}
+
+/* Finds an already-registered instrument without registering or allocating
+   anything; device helpers call it first so a repeat registration makes no
+   device API calls. Sets *full (and counts the drop) when the instrument is
+   absent and the registry has no room for it, so callers skip allocating. */
+static inline graphsignal_probe_entry* graphsignal_probe__find(
+        const char* name, const char* const* tag_keys, const char* const* tag_vals,
+        size_t ntags, int* full) {
+    *full = 0;
+    if (!name || !name[0]) return NULL;
+    ntags = graphsignal_probe__clamp_ntags(tag_keys, tag_vals, ntags);
+
+    graphsignal_probe_registry* reg = &__graphsignal_probe_registry_v1;
+    graphsignal_probe__lock(reg);
+    graphsignal_probe_entry* e =
+        graphsignal_probe__find_locked(reg, name, tag_keys, tag_vals, ntags);
+    if (!e && reg->count >= GRAPHSIGNAL_PROBE_MAX_INSTRUMENTS) {
+        reg->dropped++;
+        *full = 1;
+    }
+    graphsignal_probe__unlock(reg);
+    return e;
+}
+
 static inline graphsignal_probe_entry* graphsignal_probe__register_impl(
         const char* name, graphsignal_instrument_type type,
         const char* const* tag_keys, const char* const* tag_vals, size_t ntags,
         graphsignal_instrument_data* device_data, int device_id) {
     if (!name || !name[0]) return NULL;
-    if (ntags > GRAPHSIGNAL_PROBE_MAX_TAGS) ntags = GRAPHSIGNAL_PROBE_MAX_TAGS;
-    if (ntags > 0 && (!tag_keys || !tag_vals)) ntags = 0;
+    ntags = graphsignal_probe__clamp_ntags(tag_keys, tag_vals, ntags);
 
     graphsignal_probe_registry* reg = &__graphsignal_probe_registry_v1;
     graphsignal_probe__lock(reg);
@@ -245,15 +287,14 @@ static inline graphsignal_probe_entry* graphsignal_probe__register_impl(
         reg->start_ts = graphsignal_now_ns();
     }
 
-    uint64_t count = reg->count;
-    for (uint64_t i = 0; i < count; i++) {
-        if (graphsignal_probe__entry_matches(&reg->entries[i], name,
-                                             tag_keys, tag_vals, ntags)) {
-            graphsignal_probe__unlock(reg);
-            return &reg->entries[i];
-        }
+    graphsignal_probe_entry* existing =
+        graphsignal_probe__find_locked(reg, name, tag_keys, tag_vals, ntags);
+    if (existing) {
+        graphsignal_probe__unlock(reg);
+        return existing;
     }
 
+    uint64_t count = reg->count;
     if (count >= GRAPHSIGNAL_PROBE_MAX_INSTRUMENTS) {
         reg->dropped++;
         graphsignal_probe__unlock(reg);
@@ -316,9 +357,10 @@ static inline graphsignal_probe_entry* graphsignal_probe_register(
 
 /* Registers a DEVICE-storage instrument around a caller-allocated data block
    (device memory, zero-initialized with min=UINT64_MAX; probe_cuda.h /
-   probe_rocm.h do the allocation for you). Idempotent like
-   graphsignal_probe_register; when the entry already exists, the passed block
-   is NOT adopted — check the returned entry's `data` to free yours. */
+   probe_rocm.h do the allocation for you). The block must stay allocated for
+   the life of the process: the profiler copies it every interval. Idempotent
+   like graphsignal_probe_register; when the entry already exists, the passed
+   block is NOT adopted — check the returned entry's `data` to free yours. */
 static inline graphsignal_probe_entry* graphsignal_probe_register_storage(
         const char* name, graphsignal_instrument_type type,
         const char* const* tag_keys, const char* const* tag_vals, size_t ntags,

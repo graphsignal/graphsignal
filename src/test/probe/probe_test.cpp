@@ -194,6 +194,18 @@ static void test_registration_idempotence() {
   graphsignal_probe_entry* et2 = graphsignal_probe_register(
       long_name.c_str(), GRAPHSIGNAL_GAUGE, tk2, tv3, 1);
   ASSERT(et2 == et, "over-long registration must stay idempotent");
+
+  // The non-allocating lookup the device helpers use before allocating.
+  int full = 1;
+  ASSERT(graphsignal_probe__find("t_same", tk, tv1, 1, &full) == e1,
+         "find must return the registered entry");
+  ASSERT_EQ(full, 0, "find must not report full below the cap");
+  const uint64_t count_before = graphsignal_probe_reader_count(&__graphsignal_probe_registry_v1);
+  ASSERT(graphsignal_probe__find("t_absent", NULL, NULL, 0, &full) == NULL,
+         "find must return NULL for an absent instrument");
+  ASSERT_EQ(full, 0, "absent below the cap is not full");
+  ASSERT_EQ(graphsignal_probe_reader_count(&__graphsignal_probe_registry_v1), count_before,
+            "find must never register");
 }
 
 static void test_null_safety() {
@@ -437,6 +449,12 @@ static void test_cardinality_cap_forked() {
       _exit(8);
     }
     if (reg->dropped != dropped_before + 2) _exit(9);
+    // At the cap the lookup reports full (and counts the drop) for an absent
+    // instrument, so device helpers never allocate a block they cannot register.
+    int full = 0;
+    if (graphsignal_probe__find("cap_absent", NULL, NULL, 0, &full) != NULL || !full) _exit(10);
+    if (reg->dropped != dropped_before + 3) _exit(11);
+    if (graphsignal_probe__find("cap_instr_0", NULL, NULL, 0, &full) == NULL || full) _exit(12);
     _exit(0);
   }
 

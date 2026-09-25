@@ -41,112 +41,55 @@
 #include <cuda_runtime.h>
 
 /* Registers a histogram instrument stored in device memory on the current
-   CUDA device. Idempotent per (name, tags). Returns NULL on cap/allocation
-   failure; passing NULL downstream is safe. Host-side graphsignal_record()
-   is a no-op for device instruments — record from device code. */
+   CUDA device. Idempotent per (name, tags): a repeat call finds the existing
+   entry and makes no CUDA calls. Returns NULL on cap/allocation failure;
+   passing NULL downstream is safe. Host-side graphsignal_record() is a no-op
+   for device instruments — record from device code.
+
+   Safe to call from any thread while the application captures a CUDA graph:
+   the calls run in relaxed capture mode and the block is initialized on a
+   private non-blocking stream, so neither the capturing stream nor the legacy
+   default stream is touched. A failed call leaves no pending CUDA error behind
+   for the application's next cudaGetLastError(). Blocks are never freed —
+   instruments live for the process, and cudaFree can synchronize the device
+   mid-capture — so a block whose setup failed, or that lost a registration
+   race to another thread, stays allocated (2 KB, bounded by those events). */
 static inline graphsignal_probe_entry* graphsignal_probe_register_cuda(
         const char* name, const char* const* tag_keys,
         const char* const* tag_vals, size_t ntags) {
-    graphsignal_instrument_data* dev_data = NULL;
-    if (cudaMalloc((void**)&dev_data, sizeof(graphsignal_instrument_data)) != cudaSuccess) {
-        return NULL;
-    }
-    if (cudaMemset(dev_data, 0, sizeof(graphsignal_instrument_data)) != cudaSuccess) {
-        cudaFree(dev_data);
-        return NULL;
-    }
-    uint64_t min_init = UINT64_MAX;
-    if (cudaMemcpy(&dev_data->min, &min_init, sizeof(min_init),
-                   cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaFree(dev_data);
-        return NULL;
-    }
+    int full = 0;
+    graphsignal_probe_entry* existing =
+        graphsignal_probe__find(name, tag_keys, tag_vals, ntags, &full);
+    if (existing || full || !name || !name[0]) return existing;
 
+    const cudaError_t pending = cudaPeekAtLastError();
     int device_id = -1;
-    cudaGetDevice(&device_id);
-
-    graphsignal_probe_entry* e = graphsignal_probe_register_storage(
-        name, GRAPHSIGNAL_HISTOGRAM, tag_keys, tag_vals, ntags,
-        dev_data, device_id);
-    if (!e || e->data != dev_data) {
-        /* Registration failed or the instrument already existed. */
-        cudaFree(dev_data);
+    graphsignal_instrument_data* dev_data = NULL;
+    int ok = cudaGetDevice(&device_id) == cudaSuccess;
+    enum cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    if (ok && cudaThreadExchangeStreamCaptureMode(&mode) == cudaSuccess) {
+        cudaStream_t stream = NULL;
+        ok = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess;
+        if (ok) {
+            graphsignal_instrument_data init;
+            memset(&init, 0, sizeof(init));
+            init.min = UINT64_MAX;
+            ok = cudaMalloc((void**)&dev_data, sizeof(init)) == cudaSuccess &&
+                 cudaMemcpyAsync(dev_data, &init, sizeof(init),
+                                 cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                 cudaStreamSynchronize(stream) == cudaSuccess;
+            cudaStreamDestroy(stream);
+        }
+        cudaThreadExchangeStreamCaptureMode(&mode);  /* restore the caller's mode */
+    } else {
+        ok = 0;
     }
-    return e;
-}
-
-/* ---- pooled device instruments ------------------------------------------
-   Many device instruments (one per block, per SM, per phase ...) are best
-   allocated as ONE device array: registration is one cudaMalloc instead of
-   hundreds, and the profiler's reader copies a contiguous pool with one
-   memcpy per write instead of one per instrument. Usage:
-
-     static graphsignal_probe_cuda_pool g_pool;
-     graphsignal_probe_cuda_pool_init(&g_pool, 2000);       // capacity
-     e = graphsignal_probe_register_cuda_pooled(&g_pool, "x_nanoseconds", keys, vals, 1);
-
-   The pool is never freed (instruments are cumulative for the process).
-   Registration falls back to NULL when the pool is exhausted (counted in
-   `dropped`); an already-registered (name, tags) returns the existing entry
-   without consuming a slot. */
-#define GRAPHSIGNAL_PROBE_CUDA_POOL 1
-
-typedef struct graphsignal_probe_cuda_pool {
-    graphsignal_instrument_data* base; /* device array [capacity] */
-    size_t capacity;
-    size_t used;
-    uint64_t dropped;
-    int device_id;
-} graphsignal_probe_cuda_pool;
-
-/* Allocates `capacity` zeroed device blocks (min = UINT64_MAX) on the current
-   device. Returns 0 on success, -1 on allocation failure (pool unusable:
-   registrations on it return NULL). */
-static inline int graphsignal_probe_cuda_pool_init(graphsignal_probe_cuda_pool* p,
-                                                   size_t capacity) {
-    if (!p) return -1;
-    memset(p, 0, sizeof(*p));
-    p->device_id = -1;
-    if (capacity == 0) return -1;
-    graphsignal_instrument_data* dev = NULL;
-    const size_t bytes = capacity * sizeof(graphsignal_instrument_data);
-    if (cudaMalloc((void**)&dev, bytes) != cudaSuccess) return -1;
-    /* one host image: zeros with min = UINT64_MAX in every block */
-    graphsignal_instrument_data* img =
-        (graphsignal_instrument_data*)calloc(capacity, sizeof(graphsignal_instrument_data));
-    if (!img) {
-        cudaFree(dev);
-        return -1;
-    }
-    for (size_t i = 0; i < capacity; i++) img[i].min = UINT64_MAX;
-    const cudaError_t rc = cudaMemcpy(dev, img, bytes, cudaMemcpyHostToDevice);
-    free(img);
-    if (rc != cudaSuccess) {
-        cudaFree(dev);
-        return -1;
-    }
-    cudaGetDevice(&p->device_id);
-    p->base = dev;
-    p->capacity = capacity;
-    return 0;
-}
-
-/* Registers a histogram instrument backed by the next free block of the pool.
-   Idempotent per (name, tags) like graphsignal_probe_register_cuda. */
-static inline graphsignal_probe_entry* graphsignal_probe_register_cuda_pooled(
-        graphsignal_probe_cuda_pool* p, const char* name, const char* const* tag_keys,
-        const char* const* tag_vals, size_t ntags) {
-    if (!p || !p->base) return NULL;
-    if (p->used >= p->capacity) {
-        p->dropped++;
+    if (!ok) {
+        if (pending == cudaSuccess) (void)cudaGetLastError();  /* clear only our error */
         return NULL;
     }
-    graphsignal_instrument_data* slot = p->base + p->used;
-    graphsignal_probe_entry* e = graphsignal_probe_register_storage(
-        name, GRAPHSIGNAL_HISTOGRAM, tag_keys, tag_vals, ntags, slot, p->device_id);
-    if (!e) return NULL;
-    if (e->data == slot) p->used++; /* a pre-existing entry keeps its own block */
-    return e;
+    return graphsignal_probe_register_storage(
+        name, GRAPHSIGNAL_HISTOGRAM, tag_keys, tag_vals, ntags, dev_data, device_id);
 }
 
 /* Device pointer to pass into kernels. NULL-safe. */

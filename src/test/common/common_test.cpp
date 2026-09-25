@@ -188,12 +188,14 @@ static void hook_count(void* arg) {
   (*static_cast<int*>(arg))++;
 }
 
-static bool fake_device_reader(const graphsignal_probe_entry* e,
-                               graphsignal_instrument_data* out, void* arg) {
+static void fake_device_reader(const graphsignal_probe_entry* const* entries, size_t n,
+                               graphsignal_instrument_data* out, uint8_t* ok, void* arg) {
   (void)arg;
-  // The test's "device" data block is really host memory: plain copy.
-  std::memcpy(out, e->data, sizeof(*out));
-  return true;
+  // The test's "device" data blocks are really host memory: plain copies.
+  for (size_t i = 0; i < n; i++) {
+    std::memcpy(&out[i], entries[i]->data, sizeof(out[i]));
+    ok[i] = 1;
+  }
 }
 
 // ---- cases ----------------------------------------------------------------
@@ -227,79 +229,63 @@ static void test_init_lifecycle() {
   w->shutdown();
 }
 
-// Batch reader over fake "device" blocks that live in host memory: records
-// every (first, n) run it is asked for so the coalescing can be checked.
-static std::vector<std::pair<const graphsignal_instrument_data*, size_t>> g_batch_calls;
-static bool fake_batch_reader(const graphsignal_instrument_data* first, size_t n,
-                              graphsignal_instrument_data* out, void*) {
-  g_batch_calls.push_back(std::make_pair(first, n));
-  memcpy(out, first, n * sizeof(graphsignal_instrument_data));
-  return true;
+// Device reader over fake "device" blocks in host memory: counts calls and
+// probes, and refuses one block, so the skip path can be checked.
+static const graphsignal_instrument_data* g_refused_block = NULL;
+static int g_reader_calls = 0;
+static size_t g_reader_probes = 0;
+static void refusing_device_reader(const graphsignal_probe_entry* const* entries, size_t n,
+                                   graphsignal_instrument_data* out, uint8_t* ok, void*) {
+  g_reader_calls++;
+  g_reader_probes += n;
+  for (size_t i = 0; i < n; i++) {
+    if (entries[i]->data == g_refused_block) continue;
+    memcpy(&out[i], entries[i]->data, sizeof(out[i]));
+    ok[i] = 1;
+  }
 }
 
-static void test_device_probe_batching() {
-  CASE("device probe batch reader coalesces contiguous blocks");
+static void test_device_probe_reader() {
+  CASE("device probe reader: one call per write with every probe, a failed copy skips only that probe");
 
   std::string dir = make_temp_dir();
   graphsignal::MetricsWriter* w = graphsignal::MetricsWriter::init(
       "cupti", dir.c_str(), kLongIntervalNs, false);
   ASSERT(w != NULL, "init must return a writer");
 
-  // Pool of 4 contiguous blocks + one separate block: 2 runs expected.
-  graphsignal_instrument_data* pool = static_cast<graphsignal_instrument_data*>(
-      calloc(4, sizeof(graphsignal_instrument_data)));
-  graphsignal_instrument_data* lone = static_cast<graphsignal_instrument_data*>(
+  graphsignal_instrument_data* ok_block = static_cast<graphsignal_instrument_data*>(
       calloc(1, sizeof(graphsignal_instrument_data)));
-  ASSERT(pool != NULL && lone != NULL, "calloc must succeed");
-  for (int i = 0; i < 4; i++) {
-    pool[i].min = UINT64_MAX;
-    pool[i].count = 1;
-    pool[i].sum = 10 + i;
-    pool[i].min = pool[i].max = 10 + i;
-    pool[i].bins[graphsignal_probe_bin_index(10 + i)]++;
-  }
-  lone->min = UINT64_MAX;
-  lone->count = 1; lone->sum = 99; lone->min = lone->max = 99;
-  lone->bins[graphsignal_probe_bin_index(99)]++;
-  // Register in an order that is NOT the address order.
-  const char* keys[] = {"i"};
-  const char* v2[] = {"2"}; const char* v0[] = {"0"}; const char* v3[] = {"3"}; const char* v1[] = {"1"};
-  ASSERT(graphsignal_probe_register_storage("batch_pool", GRAPHSIGNAL_HISTOGRAM, keys, v2, 1, &pool[2], 0) != NULL, "reg 2");
-  ASSERT(graphsignal_probe_register_storage("batch_lone", GRAPHSIGNAL_HISTOGRAM, NULL, NULL, 0, lone, 0) != NULL, "reg lone");
-  ASSERT(graphsignal_probe_register_storage("batch_pool", GRAPHSIGNAL_HISTOGRAM, keys, v0, 1, &pool[0], 0) != NULL, "reg 0");
-  ASSERT(graphsignal_probe_register_storage("batch_pool", GRAPHSIGNAL_HISTOGRAM, keys, v3, 1, &pool[3], 0) != NULL, "reg 3");
-  ASSERT(graphsignal_probe_register_storage("batch_pool", GRAPHSIGNAL_HISTOGRAM, keys, v1, 1, &pool[1], 0) != NULL, "reg 1");
+  graphsignal_instrument_data* bad_block = static_cast<graphsignal_instrument_data*>(
+      calloc(1, sizeof(graphsignal_instrument_data)));
+  ASSERT(ok_block != NULL && bad_block != NULL, "calloc must succeed");
+  ok_block->count = 1; ok_block->sum = 99; ok_block->min = ok_block->max = 99;
+  ok_block->bins[graphsignal_probe_bin_index(99)]++;
+  bad_block->min = UINT64_MAX;
+  ASSERT(graphsignal_probe_register_storage("reader_ok", GRAPHSIGNAL_HISTOGRAM, NULL, NULL, 0,
+                                            ok_block, 0) != NULL, "reg ok");
+  ASSERT(graphsignal_probe_register_storage("reader_refused", GRAPHSIGNAL_HISTOGRAM, NULL, NULL, 0,
+                                            bad_block, 0) != NULL, "reg refused");
 
-  g_batch_calls.clear();
-  w->set_device_probe_batch_reader(fake_batch_reader, NULL);
+  g_refused_block = bad_block;
+  w->set_device_probe_reader(refusing_device_reader, NULL);
+  g_reader_calls = 0;
+  g_reader_probes = 0;
   w->write_now(false);
   std::string j = read_file(w->file_path());
   assert_well_formed(j);
-  // Earlier cases registered other DEVICE probes in this process (fake blocks
-  // elsewhere in host memory); those are runs of their own. The pool must be
-  // one run of 4 starting at pool[0], the lone block a run of 1.
-  bool pool_run = false, lone_run = false;
-  for (size_t k = 0; k < g_batch_calls.size(); k++) {
-    if (g_batch_calls[k].first == pool && g_batch_calls[k].second == 4) pool_run = true;
-    if (g_batch_calls[k].first == lone && g_batch_calls[k].second == 1) lone_run = true;
-    ASSERT(!(g_batch_calls[k].first >= pool && g_batch_calls[k].first < pool + 4 && g_batch_calls[k].first != pool),
-           "pool blocks must not be split into several runs");
+  // Earlier cases registered other DEVICE probes in this process; every one
+  // is read exactly once per write.
+  uint64_t device_probes = 0;
+  graphsignal_probe_registry* reg = graphsignal_probe_reader_attach();
+  ASSERT(reg != NULL, "registry must be attached");
+  for (uint64_t i = 0; i < graphsignal_probe_reader_count(reg); i++) {
+    if (reg->entries[i].storage == GRAPHSIGNAL_STORAGE_DEVICE) device_probes++;
   }
-  ASSERT(pool_run, "the 4 contiguous blocks must be read as one run");
-  ASSERT(lone_run, "the lone block must be read as a run of 1");
-  ASSERT(w->last_device_runs() < w->last_device_probes(), "fewer runs than device probes");
-  // Every probe still lands under its own name/tags with its own values.
-  for (int i = 0; i < 4; i++) {
-    char tag[64];
-    std::snprintf(tag, sizeof(tag), "\"tags\":{\"i\":\"%d\"}", i);
-    std::string obj = metric_object_with(j, "batch_pool", tag);
-    ASSERT(!obj.empty(), "pooled probe must be serialized");
-    char agg[64];
-    std::snprintf(agg, sizeof(agg), "\"count\":1,\"sum\":%d,", 10 + i);
-    ASSERT(contains(obj, agg), "pooled probe keeps its own values");
-  }
-  std::string lobj = metric_object(j, "batch_lone");
-  ASSERT(contains(lobj, "\"count\":1,\"sum\":99,"), "lone probe values");
+  ASSERT_EQ(g_reader_calls, 1, "one reader call per write");
+  ASSERT_EQ((uint64_t)g_reader_probes, device_probes, "the call carries every device probe");
+  ASSERT(contains(metric_object(j, "reader_ok"), "\"count\":1,\"sum\":99,"),
+         "a successful read serializes the probe");
+  ASSERT(!contains(j, "reader_refused"), "a failed read skips the probe for this write");
   w->shutdown();
 }
 
@@ -790,7 +776,7 @@ int main() {
   test_log_ring();
   test_flush_hook();
   test_probe_merge();
-  test_device_probe_batching();
+  test_device_probe_reader();
   test_shutdown();
 
   std::printf("All common tests passed!\n");

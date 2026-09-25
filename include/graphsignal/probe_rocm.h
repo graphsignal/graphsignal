@@ -20,37 +20,54 @@
 #include <hip/hip_runtime.h>
 
 /* Registers a histogram instrument stored in device memory on the current
-   HIP device. Idempotent per (name, tags). Returns NULL on cap/allocation
-   failure; passing NULL downstream is safe. */
+   HIP device. Idempotent per (name, tags): a repeat call finds the existing
+   entry and makes no HIP calls. Returns NULL on cap/allocation failure;
+   passing NULL downstream is safe.
+
+   Safe to call from any thread while the application captures a HIP graph:
+   the calls run in relaxed capture mode and the block is initialized on a
+   private non-blocking stream, so neither the capturing stream nor the null
+   stream is touched. A failed call leaves no pending HIP error behind for the
+   application's next hipGetLastError(). Blocks are never freed — instruments
+   live for the process, and hipFree can synchronize the device mid-capture —
+   so a block whose setup failed, or that lost a registration race to another
+   thread, stays allocated (2 KB, bounded by those events). */
 static inline graphsignal_probe_entry* graphsignal_probe_register_rocm(
         const char* name, const char* const* tag_keys,
         const char* const* tag_vals, size_t ntags) {
-    graphsignal_instrument_data* dev_data = NULL;
-    if (hipMalloc((void**)&dev_data, sizeof(graphsignal_instrument_data)) != hipSuccess) {
-        return NULL;
-    }
-    if (hipMemset(dev_data, 0, sizeof(graphsignal_instrument_data)) != hipSuccess) {
-        hipFree(dev_data);
-        return NULL;
-    }
-    uint64_t min_init = UINT64_MAX;
-    if (hipMemcpy(&dev_data->min, &min_init, sizeof(min_init),
-                  hipMemcpyHostToDevice) != hipSuccess) {
-        hipFree(dev_data);
-        return NULL;
-    }
+    int full = 0;
+    graphsignal_probe_entry* existing =
+        graphsignal_probe__find(name, tag_keys, tag_vals, ntags, &full);
+    if (existing || full || !name || !name[0]) return existing;
 
+    const hipError_t pending = hipPeekAtLastError();
     int device_id = -1;
-    hipGetDevice(&device_id);
-
-    graphsignal_probe_entry* e = graphsignal_probe_register_storage(
-        name, GRAPHSIGNAL_HISTOGRAM, tag_keys, tag_vals, ntags,
-        dev_data, device_id);
-    if (!e || e->data != dev_data) {
-        /* Registration failed or the instrument already existed. */
-        hipFree(dev_data);
+    graphsignal_instrument_data* dev_data = NULL;
+    int ok = hipGetDevice(&device_id) == hipSuccess;
+    hipStreamCaptureMode mode = hipStreamCaptureModeRelaxed;
+    if (ok && hipThreadExchangeStreamCaptureMode(&mode) == hipSuccess) {
+        hipStream_t stream = NULL;
+        ok = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) == hipSuccess;
+        if (ok) {
+            graphsignal_instrument_data init;
+            memset(&init, 0, sizeof(init));
+            init.min = UINT64_MAX;
+            ok = hipMalloc((void**)&dev_data, sizeof(init)) == hipSuccess &&
+                 hipMemcpyAsync(dev_data, &init, sizeof(init),
+                                hipMemcpyHostToDevice, stream) == hipSuccess &&
+                 hipStreamSynchronize(stream) == hipSuccess;
+            (void)hipStreamDestroy(stream);
+        }
+        (void)hipThreadExchangeStreamCaptureMode(&mode);  /* restore the caller's mode */
+    } else {
+        ok = 0;
     }
-    return e;
+    if (!ok) {
+        if (pending == hipSuccess) (void)hipGetLastError();  /* clear only our error */
+        return NULL;
+    }
+    return graphsignal_probe_register_storage(
+        name, GRAPHSIGNAL_HISTOGRAM, tag_keys, tag_vals, ntags, dev_data, device_id);
 }
 
 /* Device pointer to pass into kernels. NULL-safe. */
