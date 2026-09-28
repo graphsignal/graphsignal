@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "graphsignal"
-version = "1.0.0"
+version = "1.1.0"
 description = "GPU profiler for AI agents optimizing inference performance"
 authors = ["Graphsignal, Inc. <devops@graphsignal.com>"]
 license = "Apache-2.0"
