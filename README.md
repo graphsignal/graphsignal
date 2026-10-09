@@ -94,6 +94,25 @@ The endpoint is what closes the loop: an AI agent launches the workload under `g
 
 Engines that capture their decode step into a CUDA graph — vLLM, SGLang, TensorRT-LLM, llama.cpp — replay one graph per token, so by default their decode time arrives as whole replays in `cuda_graphs_nanoseconds` and `cuda_kernels_nanoseconds` holds only the eager (prefill) kernels. When the loop needs a per-kernel ranking, relaunch with `--cuda-graph-trace node`: the same kernels then appear in `cuda_kernels_nanoseconds` by symbol, `cuda_graphs_nanoseconds` goes empty, and the `cuda_graph_trace_mode` gauge records which granularity produced the payload. It needs no elevated privileges — it is an investigation mode, not a deployment default (see Overhead).
 
+## Live view
+
+`graphsignal-top` is the same endpoint for people: a `top`-like terminal view of the workload, refreshed every second.
+
+```bash
+graphsignal-top
+```
+
+<img src="assets/graphsignal-top.png" alt="graphsignal-top: GPU utilization and memory, engine throughput and latency, GPU time breakdown, and kernels ranked by time for Qwen3-32B on two RTX PRO 6000s under SGLang" width="100%">
+
+Per GPU: utilization over time, memory, power, temperature, clocks, PCIe traffic, XID errors and throttling, all from the NVML telemetry. The engine block comes from the scraped Prometheus metrics: running and waiting requests, KV-cache usage, token throughput over time, and TTFT / TPOT / end-to-end latency quantiles. Rates and the kernel ranking cover the last 5 seconds (`--window`). Kernels are named by a built-in taxonomy; the details view (`⏎`) shows the full mangled symbol, the totals since start, and the per-process split. `g`, `m` and `s` switch the table to CUDA graph replays, memory transfers and host synchronization.
+
+A workload on another machine is one flag away, provided its profiler was started with `--listen-host`:
+
+```bash
+graphsignal-top --host gpu-box --port 18259
+```
+
+`graphsignal-top --once` prints a single frame and exits — the same view for scripts, logs, and agents that would rather read a page than a JSON payload. Colors follow `NO_COLOR` and `--no-color`.
 
 ## GPU probes
 

@@ -73,6 +73,8 @@ curl -s http://127.0.0.1:18259/signals
 
 `GET /health` returns `{"status": "ok"}` when the watcher is up. **The endpoint lives only as long as the profiled workload** — read it while the process runs; after a crash, the last errors are in the workload's console output.
 
+`graphsignal-top --once` prints the same data as one readable page (GPU telemetry, engine throughput and latency, GPU-time breakdown, kernels ranked by time with readable names) — handy for a quick look or a log; the JSON below is the complete source.
+
 ### Reaching it from another machine or container
 
 The endpoint binds to `127.0.0.1`, so by default it is readable only from where the workload runs. Two ways across, both of which keep it on loopback at each end:
@@ -112,7 +114,8 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
     {"name": "vllm:e2e_request_latency_seconds", "type": "histogram",
      "tags": {"process.pid": "123"},
      "stats": {"count": 1204, "sum": 505.68, "min": null, "max": null,
-               "mean": 0.42, "p50": 0.3, "p95": 1.5},
+               "mean": 0.42, "p50": 0.3, "p95": 1.5,
+               "bins": [0.1, 0.3, 1.5, 5.0], "counts": [310, 522, 300, 72]},
      "updated_ns": 1756150000000000000},
     {"name": "cuda_memcpy_bytes", "type": "counter",
      "tags": {"kind": "host_to_device", "process.pid": "123"},
@@ -140,7 +143,7 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 - `start_ns` is when this instance started — the base every cumulative stat accumulates from.
 - **gauge** — the latest sampled value (`stats.value`).
 - **counter** — cumulative total since `start_ns` (`stats.total`).
-- **histogram** — the one distribution type, cumulative: exact `count`, `sum`, `min`, `max` (`min`/`max` are lifetime extremes, and only sources that keep them report them — probes and the CUPTI/ROCm libraries do, Prometheus does not), `mean` (sum / count), and `p50`, `p95` computed from its bins (quantiles are bin values; resolution ≤25%). `sum / <iterations>` is the time per iteration of a probed region; `count` is how often it ran. A source with no buckets — a Prometheus summary — reports the totals with `p50`/`p95` as `null`; that is a whole histogram, not a broken one.
+- **histogram** — the one distribution type, cumulative: exact `count`, `sum`, `min`, `max` (`min`/`max` are lifetime extremes, and only sources that keep them report them — probes and the CUPTI/ROCm libraries do, Prometheus does not), `mean` (sum / count), and `p50`, `p95` computed from its bins (quantiles are bin values; resolution ≤25%). `sum / <iterations>` is the time per iteration of a probed region; `count` is how often it ran. A source with no buckets — a Prometheus summary — reports the totals with `p50`/`p95` as `null`; that is a whole histogram, not a broken one. `bins`/`counts` are the buckets themselves (`null` without buckets); diff them between two reads for quantiles over your own interval.
 - **profile** — cumulative counters per named frame (e.g. time per kernel) with the number of samples that produced each, as `stats.frames` sorted by value descending.
 - Metrics not updated for 10 minutes disappear from the report (dead workers age out).
 

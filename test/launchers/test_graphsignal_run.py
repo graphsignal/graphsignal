@@ -49,6 +49,21 @@ class GraphsignalRunDispatchTest(unittest.TestCase):
         v, s, t, f = self._run_with_argv(['graphsignal-run', 'python', '--version'])
         f.assert_called_once()
 
+    def test_help_flag_prints_usage_and_exits_zero(self):
+        for flag in ('-h', '--help'):
+            with patch.object(sys, 'argv', ['graphsignal-run', flag]), \
+                 patch('builtins.print') as out:
+                with self.assertRaises(SystemExit) as cm:
+                    graphsignal_run.main()
+            self.assertEqual(cm.exception.code, 0, flag)
+            out.assert_called_once_with(graphsignal_run.USAGE)
+
+    def test_workload_help_flag_is_forwarded(self):
+        v, s, t, f = self._run_with_argv(['graphsignal-run', 'python', 'app.py', '-h'])
+        f.assert_called_once()
+        v2, s2, t2, f2 = self._run_with_argv(['graphsignal-run', 'vllm', 'serve', '--help'])
+        v2.assert_called_once()
+
     def test_vllm_wins_over_fallback(self):
         v, s, t, f = self._run_with_argv(['graphsignal-run', 'vllm', 'serve', 'm'])
         v.assert_called_once()

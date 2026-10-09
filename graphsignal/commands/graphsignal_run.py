@@ -29,6 +29,7 @@ USAGE = """
 Run a target application with the Graphsignal profiler.
 
 Options (must precede the command):
+  -h, --help      Show this help and exit.
   --version       Print the profiler version and exit.
   --metrics-port PORT
                   Port to scrape the engine's Prometheus /metrics endpoint on.
@@ -149,6 +150,11 @@ def main():
     if '--version' in sys.argv[1:2] or '-V' in sys.argv[1:2]:
         from graphsignal.version import __version__
         print(f'graphsignal-run {__version__}')
+        sys.exit(0)
+    # Same rule for help: only as the first argument. Later in argv, `-h`
+    # belongs to the workload and passes through untouched.
+    if '--help' in sys.argv[1:2] or '-h' in sys.argv[1:2]:
+        print(USAGE)
         sys.exit(0)
 
     if len(sys.argv) < 2:

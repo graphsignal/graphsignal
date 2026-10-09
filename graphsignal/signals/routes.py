@@ -77,6 +77,7 @@ def _histogram_stats(dp):
         if total_count:
             mean = sum(b * c for b, c in zip(bins, counts)) / total_count
     quantiles = quantiles_from_bins(bins, counts) or {}
+    has_bins = bool(bins and counts and len(bins) == len(counts))
     return {
         'count': count,
         'sum': total,
@@ -85,6 +86,11 @@ def _histogram_stats(dp):
         'mean': mean,
         'p50': quantiles.get('p50'),
         'p95': quantiles.get('p95'),
+        # The bins themselves, so a consumer that diffs two snapshots
+        # (graphsignal-top) can compute quantiles over its own interval.
+        # null when the source reported totals without buckets.
+        'bins': list(bins) if has_bins else None,
+        'counts': list(counts) if has_bins else None,
     }
 
 
@@ -194,11 +200,23 @@ class _SignalsRequestHandler(http.server.BaseHTTPRequestHandler):
 
 
 class SignalsEndpoint:
-    def __init__(self, host=DEFAULT_LISTEN_HOST, port=DEFAULT_LISTEN_PORT):
+    # A busy port at startup is usually the previous run's watcher finishing
+    # its last tick, so the bind is retried for a while before giving up.
+    BIND_RETRY_INTERVAL_S = 2.0
+    BIND_RETRY_TIMEOUT_S = 120.0
+
+    def __init__(self, host=DEFAULT_LISTEN_HOST, port=DEFAULT_LISTEN_PORT,
+                 bind_retry_interval=None, bind_retry_timeout=None):
         self._host = str(host)
         self._port = int(port)
         self._server = None
         self._serve_thread = None
+        self._retry_thread = None
+        self._stopped = threading.Event()
+        self._retry_interval = (self.BIND_RETRY_INTERVAL_S if bind_retry_interval is None
+                                else float(bind_retry_interval))
+        self._retry_timeout = (self.BIND_RETRY_TIMEOUT_S if bind_retry_timeout is None
+                               else float(bind_retry_timeout))
 
     def host(self):
         return self._host
@@ -210,22 +228,44 @@ class SignalsEndpoint:
         return self._server is not None
 
     def setup(self):
-        try:
-            self._server = http.server.ThreadingHTTPServer(
-                (self._host, self._port), _SignalsRequestHandler)
-            self._server.daemon_threads = True
-        except OSError as exc:
-            logger.error('Signals endpoint failed to bind %s:%d: %s',
-                         self._host, self._port, exc)
-            self._server = None
+        if self._bind():
             return
+        if self._retry_timeout <= 0:
+            logger.error('Signals endpoint failed to bind %s:%d', self._host, self._port)
+            return
+        logger.warning('Signals endpoint could not bind %s:%d; retrying for up to %.0fs',
+                       self._host, self._port, self._retry_timeout)
+        self._retry_thread = threading.Thread(target=self._retry_bind, daemon=True)
+        self._retry_thread.start()
 
-        self._serve_thread = threading.Thread(
-            target=self._server.serve_forever, daemon=True)
+    def _bind(self):
+        """One bind attempt; True when the endpoint is serving."""
+        try:
+            server = http.server.ThreadingHTTPServer(
+                (self._host, self._port), _SignalsRequestHandler)
+        except OSError as exc:
+            logger.debug('Signals endpoint bind %s:%d: %s', self._host, self._port, exc)
+            return False
+        server.daemon_threads = True
+        self._server = server
+        self._serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
         self._serve_thread.start()
         logger.debug('Signals endpoint listening on %s:%d', self._host, self._port)
+        return True
+
+    def _retry_bind(self):
+        deadline = time.monotonic() + self._retry_timeout
+        while not self._stopped.is_set() and time.monotonic() < deadline:
+            if self._stopped.wait(self._retry_interval):
+                return
+            if self._bind():
+                return
+        if not self._stopped.is_set():
+            logger.error('Signals endpoint failed to bind %s:%d after %.0fs; endpoint disabled',
+                         self._host, self._port, self._retry_timeout)
 
     def shutdown(self):
+        self._stopped.set()
         if self._server is None:
             return
         try:

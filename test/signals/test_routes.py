@@ -4,6 +4,7 @@ from graphsignal import version
 from graphsignal.signals.routes import build_payload, quantiles_from_bins
 from test.test_utils import configure_test_watcher
 import json
+import time
 import urllib.error
 import urllib.request
 from graphsignal.signals.routes import SignalsEndpoint
@@ -91,6 +92,8 @@ class BuildPayloadTest(unittest.TestCase):
             'mean': 23.75,
             'p50': None,
             'p95': None,
+            'bins': None,
+            'counts': None,
         })
 
     def test_histogram_stats_zero_count_mean_is_null(self):
@@ -119,6 +122,8 @@ class BuildPayloadTest(unittest.TestCase):
             'mean': 23.75,
             'p50': 20,
             'p95': 50,
+            'bins': [5, 20, 50],
+            'counts': [1, 2, 1],
         })
 
     def test_histogram_stats_exact_aggregates(self):
@@ -253,9 +258,38 @@ class SignalsEndpointTest(unittest.TestCase):
         self.assertEqual(record['stats'], {'value': 20.0})
 
     def test_second_endpoint_on_same_port_disabled_without_exception(self):
-        second = SignalsEndpoint(port=self.port)
+        second = SignalsEndpoint(port=self.port, bind_retry_timeout=0)
         second.setup()  # must not raise
         try:
+            self.assertFalse(second.is_running())
+        finally:
+            second.shutdown()
+
+    def test_endpoint_binds_once_the_port_frees_up(self):
+        # The previous run's watcher releasing the port a moment after the new
+        # one starts must not cost the new run its endpoint.
+        second = SignalsEndpoint(port=self.port, bind_retry_interval=0.05,
+                                 bind_retry_timeout=5)
+        second.setup()
+        try:
+            self.assertFalse(second.is_running())
+            self.watcher.signals_endpoint().shutdown()
+            deadline = time.time() + 5
+            while not second.is_running() and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(second.is_running())
+            with urllib.request.urlopen(
+                    f'http://127.0.0.1:{self.port}/health', timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+        finally:
+            second.shutdown()
+
+    def test_endpoint_gives_up_after_timeout(self):
+        second = SignalsEndpoint(port=self.port, bind_retry_interval=0.05,
+                                 bind_retry_timeout=0.2)
+        second.setup()
+        try:
+            time.sleep(0.5)
             self.assertFalse(second.is_running())
         finally:
             second.shutdown()
