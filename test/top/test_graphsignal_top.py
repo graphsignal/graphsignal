@@ -6,7 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
 
-from graphsignal.top import cli
+from graphsignal.commands import graphsignal_top as cli
 from graphsignal.top.client import SignalsClient, SignalsUnavailable
 from graphsignal.top.state import TopState
 from test.top import fixtures as fx

@@ -1,4 +1,7 @@
-"""`graphsignal-top`: a live terminal view of a workload run under graphsignal-run."""
+"""`graphsignal-top`: a live terminal view of a workload run under graphsignal-run.
+
+The view itself lives in graphsignal/top; this is its command-line entry point,
+next to graphsignal-run and graphsignal-watch."""
 
 import shutil
 import sys

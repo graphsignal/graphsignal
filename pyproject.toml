@@ -50,7 +50,7 @@ pytest-forked = "*"
 
 [tool.poetry.scripts]
 graphsignal-run = "graphsignal.commands.graphsignal_run:main"
-graphsignal-top = "graphsignal.top.cli:main"
+graphsignal-top = "graphsignal.commands.graphsignal_top:main"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
