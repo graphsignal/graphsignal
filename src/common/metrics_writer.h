@@ -154,6 +154,9 @@ class MetricsWriter {
     }
   }
 
+  // The periodic write interval in effect (the default when init got 0).
+  uint64_t interval_ns() const { return interval_ns_; }
+
   void set_flush_hook(FlushHook fn, void* arg) {
     std::lock_guard<std::mutex> g(hook_mu_);
     flush_hook_ = fn;
@@ -348,7 +351,7 @@ class MetricsWriter {
                      [this]() { return stopped_.load(); });
       }
       bool stopping = stopped_.load();
-      // The flush hook (e.g. cuptiActivityFlushAll) is never called on the
+      // The flush hook (e.g. the ROCm lib's rocprofiler flush) is never called on the
       // final write: no CUDA/ROCm calls on the teardown path.
       write_now(/*call_hook=*/!stopping);
       if (stopping) return;

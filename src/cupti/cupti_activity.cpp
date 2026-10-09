@@ -4,6 +4,8 @@
 #include <cuda.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +13,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -363,13 +366,74 @@ static const std::string& graph_frame_name(uint32_t graph_id) {
 // Writer hooks
 // ---------------------------------------------------------------------------
 
-// Called by the writer thread before each periodic serialize so buffered CUPTI
-// activity reaches the instruments first. The Writer never calls it on the
-// final shutdown write, and the g_running guard keeps it from touching CUPTI
-// while stop is tearing profiling down.
-static void writer_flush_hook(void*) {
-  if (!g_running.load(std::memory_order_relaxed)) return;
-  cuptiActivityFlushAll(CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+// Flushing CUPTI's activity buffers.
+//
+// cuptiActivityFlushAll is a blocking call. Under sustained tensor-parallel
+// traffic (NCCL ring kernels relaunched back to back on two GPUs) it was
+// observed to block for 30 s to several minutes at a time — with the forced
+// flag and with the default flag alike. It used to run on the Writer's thread
+// as its flush hook, so every such stall froze the shm snapshot while the
+// workload kept running, and a reader diffing snapshots saw zero activity.
+//
+// So the flush gets a thread of its own: it asks CUPTI for a default flush
+// (flag 0: only buffers whose records are all complete; the forced variant is
+// for session termination) about once a second and may block as long as CUPTI
+// likes. The Writer never calls CUPTI and serializes whatever bufferCompleted
+// has delivered so far — the full buffers CUPTI's own worker hands over under
+// load (cuptiActivityFlushPeriod makes that regular), plus whatever the last
+// flush returned. Thread state lives on the heap and is leaked: the thread is
+// detached, because a thread blocked inside CUPTI cannot be joined at exit,
+// and it must not touch destroyed globals when it finally returns. g_running
+// is a static atomic, safe to read post-destruction.
+constexpr uint32_t kFlushPeriodMs = 1000;
+
+struct FlushState {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::atomic<bool> in_flush{false};
+  // Our own flush cadence follows the Writer's interval (1 s by default, much
+  // shorter in tests), so a snapshot never waits on a flush slower than the
+  // write it feeds.
+  uint64_t period_ns = static_cast<uint64_t>(kFlushPeriodMs) * 1000000ULL;
+};
+static FlushState* g_flush = nullptr;  // leaked
+
+static void flush_loop(FlushState* st) {
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lk(st->mu);
+      st->cv.wait_for(lk, std::chrono::nanoseconds(st->period_ns),
+                      []() { return !g_running.load(std::memory_order_relaxed); });
+    }
+    if (!g_running.load(std::memory_order_relaxed)) return;
+    st->in_flush.store(true, std::memory_order_relaxed);
+    cuptiActivityFlushAll(0);
+    st->in_flush.store(false, std::memory_order_relaxed);
+  }
+}
+
+static void start_flush_thread() {
+  try {
+    if (!g_flush) g_flush = new FlushState();
+    if (g_writer && g_writer->interval_ns() > 0 &&
+        g_writer->interval_ns() < g_flush->period_ns) {
+      g_flush->period_ns = g_writer->interval_ns();
+    }
+    std::thread(flush_loop, g_flush).detach();
+  } catch (...) {
+    // No flush thread: CUPTI's periodic flush still delivers full buffers.
+    if (g_writer) g_writer->error("cupti flush thread creation failed");
+  }
+}
+
+// Wakes the flush thread and gives a flush in progress a bounded moment to
+// return before CUPTI is torn down. Never waits on a thread stuck in CUPTI.
+static void stop_flush_thread() {
+  if (!g_flush) return;
+  g_flush->cv.notify_all();
+  for (int i = 0; i < 20 && g_flush->in_flush.load(std::memory_order_relaxed); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
 }
 
 // Copies DEVICE-storage probe blocks (probe.h DEVICE storage) to host memory
@@ -713,10 +777,13 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode,
     g_graph_signatures.clear();
   }
 
-  g_writer->set_flush_hook(writer_flush_hook, nullptr);
+  // No Writer flush hook: the flush runs on its own thread (see flush_loop).
   g_writer->set_device_probe_reader(device_probe_reader, nullptr);
 
   CUPTI_CALL(cuptiActivityRegisterCallbacks(bufferRequested, bufferCompleted));
+  // CUPTI's own worker then delivers full, completed buffers at least this
+  // often, independently of our flush thread.
+  CUPTI_CALL(cuptiActivityFlushPeriod(kFlushPeriodMs));
 
   CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
   CUPTI_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY));
@@ -750,6 +817,8 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode,
     CUPTI_CALL(cuptiEnableDomain(1, g_subscriber, CUPTI_CB_DOMAIN_RESOURCE));
   }
 
+  start_flush_thread();
+
   std::atexit([]() { cupti_activity_stop(); });
 
   if (g_graph_trace_env_invalid[0]) {
@@ -776,6 +845,10 @@ void cupti_activity_stop(void) {
     cuptiUnsubscribe(g_subscriber);
     g_subscriber = nullptr;
   }
+
+  // g_running is already false: the flush thread exits at its next wake-up,
+  // and a flush in progress gets a bounded moment to return first.
+  stop_flush_thread();
 
   // Detach CUPTI before our memory can go away. The CUDA_INJECTION64_PATH lib
   // can be unloaded while the process keeps running CUDA; if CUPTI still holds
