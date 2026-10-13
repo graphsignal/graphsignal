@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 
@@ -46,11 +47,23 @@ def pytest_runtest_protocol(item, nextitem):
     )
     passed = proc.returncode == 0
     output = (proc.stdout + proc.stderr).strip()
+    # A test that skipped inside the subprocess also exits 0; report it as
+    # skipped (with its reason) rather than letting it pass for a GPU test
+    # that never ran.
+    skipped = passed and re.search(r"\b1 skipped\b", output) is not None
+    skip_reason = "skipped in subprocess"
+    m = re.search(r"^SKIPPED \[\d+\] [^:]+:\d+: (.*)$", output, re.M)
+    if m:
+        skip_reason = m.group(1).strip()
 
     for when in ("setup", "call", "teardown"):
         if when == "call":
-            outcome = "passed" if passed else "failed"
-            longrepr = None if passed else output
+            if skipped:
+                outcome = "skipped"
+                longrepr = (str(item.fspath), item.location[1] or 0, skip_reason)
+            else:
+                outcome = "passed" if passed else "failed"
+                longrepr = None if passed else output
         else:
             outcome = "passed"
             longrepr = None

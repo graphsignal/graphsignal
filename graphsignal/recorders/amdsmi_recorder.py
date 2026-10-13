@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,13 @@ except Exception as _exc:
     _AMDSMI_IMPORT_ERROR = _exc
 
 
+# AMD SMI keeps one process-wide state and its init/shutdown are not safe to
+# run concurrently: two recorders in one process (the watcher's own plus a
+# test's) initializing at the same time left one of them with no devices and
+# the other unable to shut down. Serialize every init/shutdown.
+_amdsmi_lifecycle_lock = threading.Lock()
+
+
 class AmdSmiRecorder(BaseRecorder):
     def __init__(self, root_pid=None, pid=None, args=None):
         super().__init__(root_pid=root_pid, pid=pid, args=args)
@@ -40,8 +48,9 @@ class AmdSmiRecorder(BaseRecorder):
                          _AMDSMI_IMPORT_ERROR)
             return
         try:
-            amdsmi.amdsmi_init()
-            handles = amdsmi.amdsmi_get_processor_handles()
+            with _amdsmi_lifecycle_lock:
+                amdsmi.amdsmi_init()
+                handles = amdsmi.amdsmi_get_processor_handles()
         except Exception:
             logger.debug('Error initializing AMD SMI, skipping AMD GPU usage',
                          exc_info=True)
@@ -71,7 +80,8 @@ class AmdSmiRecorder(BaseRecorder):
             return
         self._devices = []
         try:
-            amdsmi.amdsmi_shut_down()
+            with _amdsmi_lifecycle_lock:
+                amdsmi.amdsmi_shut_down()
         except Exception:
             logger.debug('Error shutting down AMD SMI', exc_info=True)
         self._is_initialized = False

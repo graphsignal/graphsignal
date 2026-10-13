@@ -9,7 +9,7 @@ from graphsignal.recorders.amdsmi_recorder import AmdSmiRecorder
 from test.test_utils import configure_test_watcher, find_metric
 
 
-def has_amd_gpu() -> bool:
+def _detect_amd_gpu() -> bool:
     try:
         import amdsmi
         amdsmi.amdsmi_init()
@@ -24,6 +24,17 @@ def has_amd_gpu() -> bool:
     except Exception:
         pass
     return found
+
+
+# Detected once at import, before any test watcher exists: a configured
+# watcher wires its own AmdSmiRecorder on a background thread, and probing
+# AMD SMI (init + shut_down) concurrently with that races it — the probe
+# reported no GPU on a live MI300X.
+_HAS_AMD_GPU = _detect_amd_gpu()
+
+
+def has_amd_gpu() -> bool:
+    return _HAS_AMD_GPU
 
 
 class _FakeAmdSmiError(Exception):
