@@ -264,6 +264,7 @@ class HeaderView:
     window_s: Optional[float] = None
     unavailable: Optional[str] = None
     rocm: bool = False
+    rocm_kernel_trace: Optional[str] = None  # 'none' | 'all' | None
 
 
 class TopState:
@@ -487,6 +488,9 @@ class TopState:
         if mode is not None:
             view.graph_trace_mode = 'node' if mode >= 1 else 'graph'
         view.rocm = any(name.startswith('rocm_') for name in snap.names())
+        kernel_trace = snap.gauge_sum('rocm_kernel_trace_mode')
+        if kernel_trace is not None:
+            view.rocm_kernel_trace = 'all' if kernel_trace >= 1 else 'none'
 
         root = None
         for resource in payload.get('resources') or []:

@@ -29,7 +29,8 @@ class TrtllmLauncher(BaseLauncher):
                 'engine Prometheus metrics will not be scraped')
 
         CuptiProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace)
-        RocmProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace)
+        RocmProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace,
+                                    rocm_kernel_trace=self.rocm_kernel_trace)
 
         metrics_port = resolve_metrics_port(
             self.metrics_port, self.args, default=DEFAULT_SERVE_PORT)

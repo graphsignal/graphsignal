@@ -29,7 +29,8 @@ class SglangLauncher(BaseLauncher):
 
     def launch(self) -> None:
         CuptiProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace)
-        RocmProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace)
+        RocmProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace,
+                                    rocm_kernel_trace=self.rocm_kernel_trace)
 
         new_args = _inject_sglang_args(self.args)
 

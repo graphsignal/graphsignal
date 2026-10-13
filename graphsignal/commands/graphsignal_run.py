@@ -48,6 +48,13 @@ Options (must precede the command):
                   the graph individually in cuda_kernels_nanoseconds, at
                   higher CUPTI cost. Also settable via
                   GRAPHSIGNAL_CUDA_GRAPH_TRACE; the flag wins.
+  --rocm-kernel-trace {none|all}
+                  Per-kernel tracing on ROCm (default: none). `all` times
+                  every kernel dispatch into rocm_kernels_nanoseconds;
+                  rocprofiler-sdk charges tens of microseconds per dispatch
+                  for it, so use it for an investigation, not in production.
+                  Also settable via GRAPHSIGNAL_ROCM_KERNEL_TRACE; the flag
+                  wins.
 
 Example:
   graphsignal-run vllm serve facebook/opt-125m --port 8001
@@ -59,6 +66,7 @@ Example:
 
 
 CUDA_GRAPH_TRACE_MODES = ('graph', 'node')
+ROCM_KERNEL_TRACE_MODES = ('none', 'all')
 
 
 def _extract_graphsignal_flags(argv):
@@ -67,6 +75,7 @@ def _extract_graphsignal_flags(argv):
     `--metrics-port` specifies the Prometheus scrape port.
     `--listen-host`/`--listen-port` specify the /signals endpoint bind address.
     `--cuda-graph-trace` selects the CUDA graph tracing granularity.
+    `--rocm-kernel-trace` switches per-kernel tracing on ROCm on or off.
     All are consumed here and never forwarded to the workload. Only leading
     flags (before the workload command) are parsed, so identically named
     workload flags later in argv are left untouched.
@@ -75,6 +84,7 @@ def _extract_graphsignal_flags(argv):
     listen_host = None
     listen_port = None
     cuda_graph_trace = None
+    rocm_kernel_trace = None
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -122,8 +132,20 @@ def _extract_graphsignal_flags(argv):
             cuda_graph_trace = _parse_cuda_graph_trace(arg.split('=', 1)[1])
             i += 1
             continue
+        if arg == '--rocm-kernel-trace':
+            if i + 1 >= len(argv):
+                print("graphsignal-run: --rocm-kernel-trace requires a value\n")
+                sys.exit(1)
+            rocm_kernel_trace = _parse_rocm_kernel_trace(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith('--rocm-kernel-trace='):
+            rocm_kernel_trace = _parse_rocm_kernel_trace(arg.split('=', 1)[1])
+            i += 1
+            continue
         break
-    return metrics_port, listen_host, listen_port, cuda_graph_trace, argv[i:]
+    return (metrics_port, listen_host, listen_port, cuda_graph_trace,
+            rocm_kernel_trace, argv[i:])
 
 
 def _parse_port(flag, value):
@@ -139,6 +161,15 @@ def _parse_cuda_graph_trace(value):
     if mode not in CUDA_GRAPH_TRACE_MODES:
         print("graphsignal-run: invalid --cuda-graph-trace value: %s (expected %s)\n"
               % (value, '|'.join(CUDA_GRAPH_TRACE_MODES)))
+        sys.exit(1)
+    return mode
+
+
+def _parse_rocm_kernel_trace(value):
+    mode = (value or '').strip().lower()
+    if mode not in ROCM_KERNEL_TRACE_MODES:
+        print("graphsignal-run: invalid --rocm-kernel-trace value: %s (expected %s)\n"
+              % (value, '|'.join(ROCM_KERNEL_TRACE_MODES)))
         sys.exit(1)
     return mode
 
@@ -165,14 +196,15 @@ def main():
     _setup_logging()
 
     (metrics_port, listen_host, listen_port, cuda_graph_trace,
-     target_args) = _extract_graphsignal_flags(sys.argv[1:])
+     rocm_kernel_trace, target_args) = _extract_graphsignal_flags(sys.argv[1:])
     log.debug('graphsignal-run target args: %s (metrics_port=%s, listen_host=%s, '
-              'listen_port=%s, cuda_graph_trace=%s)',
-              target_args, metrics_port, listen_host, listen_port, cuda_graph_trace)
+              'listen_port=%s, cuda_graph_trace=%s, rocm_kernel_trace=%s)',
+              target_args, metrics_port, listen_host, listen_port, cuda_graph_trace,
+              rocm_kernel_trace)
 
     launcher_kwargs = dict(
         metrics_port=metrics_port, listen_host=listen_host, listen_port=listen_port,
-        cuda_graph_trace=cuda_graph_trace)
+        cuda_graph_trace=cuda_graph_trace, rocm_kernel_trace=rocm_kernel_trace)
     launchers = [
         VllmLauncher(target_args, **launcher_kwargs),
         SglangLauncher(target_args, **launcher_kwargs),

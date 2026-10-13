@@ -11,10 +11,12 @@
 #
 # ROCm is amd64 only — there is no ARM GPU target.
 ARG ROCM_VERSION=7.2.3
-# The `-complete` dev image ships rocprofiler-sdk headers + libs (no distro
-# package dance needed). ROCm 7 is the first well-supported rocprofiler-sdk
-# floor (the API stabilized ~6.4); target it first.
-FROM --platform=linux/amd64 rocm/dev-ubuntu-22.04:${ROCM_VERSION}-complete AS builder
+# The full dev image ships rocprofiler-sdk headers + libs (no distro package
+# dance needed). Its tag suffix is `-complete` up to ROCm 7.2 and `-full` from
+# ROCm 7.14 / 10.0 on (TheRock builds), so the Makefile passes the tag. ROCm 7
+# is the first well-supported rocprofiler-sdk floor (the API stabilized ~6.4).
+ARG ROCM_IMAGE_TAG=${ROCM_VERSION}-complete
+FROM --platform=linux/amd64 rocm/dev-ubuntu-22.04:${ROCM_IMAGE_TAG} AS builder
 
 ARG ROCM_MAJOR=7
 ARG TARGETARCH

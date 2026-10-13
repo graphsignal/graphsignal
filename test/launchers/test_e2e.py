@@ -128,8 +128,9 @@ WORKLOAD = textwrap.dedent('''
     try:
         _log(f'PID={os.getpid()}')
         _log(f'CUDA_INJECTION64_PATH={os.environ.get("CUDA_INJECTION64_PATH", "<unset>")}')
+        _log(f'ROCP_TOOL_LIBRARIES={os.environ.get("ROCP_TOOL_LIBRARIES", "<unset>")}')
         import torch
-        _log(f'torch_imported, cuda_available={torch.cuda.is_available()}')
+        _log(f'torch_imported, cuda_available={torch.cuda.is_available()}, hip={torch.version.hip}')
         a = torch.randn((64, 64), device='cuda', dtype=torch.float16)
         b = torch.randn((64, 64), device='cuda', dtype=torch.float16)
         _log('tensors_created')
@@ -147,7 +148,7 @@ WORKLOAD = textwrap.dedent('''
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'),
-                     "graphsignal-run CUDA e2e requires Linux (CUPTI injection)")
+                     "graphsignal-run GPU e2e requires Linux (CUPTI/ROCm injection)")
 class GraphsignalRunCudaE2ETest(unittest.TestCase):
     def setUp(self):
         if not _torch_cuda_available_in_subprocess():
@@ -203,13 +204,18 @@ class GraphsignalRunCudaE2ETest(unittest.TestCase):
                 msg=(f"workload did not reach 'done'; trail=\n{trail}\n"
                      f"stdout={proc.stdout!r} stderr={proc.stderr!r}"))
 
-            # And confirm CUPTI actually attached (CUDA_INJECTION64_PATH was
-            # forwarded by the launcher).
-            self.assertIn('CUDA_INJECTION64_PATH=', trail)
+            # And confirm the activity library actually attached: the launcher
+            # forwards CUDA_INJECTION64_PATH on CUDA and ROCP_TOOL_LIBRARIES on
+            # ROCm (torch reports a HIP version there).
+            on_rocm = 'hip=None' not in trail and 'hip=' in trail
+            var = 'ROCP_TOOL_LIBRARIES' if on_rocm else 'CUDA_INJECTION64_PATH'
+            self.assertIn(f'{var}=', trail)
             inj_line = next(
-                ln for ln in trail.splitlines() if ln.startswith('CUDA_INJECTION64_PATH='))
+                ln for ln in trail.splitlines() if ln.startswith(f'{var}='))
             self.assertNotIn('<unset>', inj_line,
-                             msg=f"launcher did not set CUDA_INJECTION64_PATH; trail=\n{trail}")
+                             msg=f"launcher did not set {var}; trail=\n{trail}")
+            if on_rocm:
+                self.assertIn('libgsrocmprof.so', inj_line)
         finally:
             os.unlink(script)
             if os.path.exists(output_path):

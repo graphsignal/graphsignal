@@ -212,6 +212,15 @@ static uint64_t frame_value_containing(const std::string& block,
   return 0;
 }
 
+// Sample count of the first frame whose name contains `sub`; 0 when absent.
+static uint64_t frame_samples_containing(const std::string& block,
+                                         const std::string& sub) {
+  for (const Frame& f : parse_frames(block)) {
+    if (f.name.find(sub) != std::string::npos) return f.samples;
+  }
+  return 0;
+}
+
 // Sums the sparse "counts":[...] array of a histogram block.
 static uint64_t counts_total(const std::string& block) {
   const std::string m = "\"counts\":[";
@@ -227,22 +236,26 @@ static uint64_t counts_total(const std::string& block) {
   return total;
 }
 
-// Histograms serialize ONLY the sparse bins/counts arrays (no aggregate
-// fields); a well-formed one observed at least one value.
-static void assert_histogram_sane(const std::string& block, const char* what) {
+// Histogram sanity: sparse bins/counts arrays plus the exact aggregates
+// (count = the sum of the counts, sum, min, max) whenever a value was observed.
+static void assert_histogram_sane(const std::string& block, uint64_t min_count,
+                                  const char* what) {
   ASSERT(!block.empty(), what);
   ASSERT(block.find("\"type\":\"histogram\"") != std::string::npos, what);
   ASSERT(block.find("\"bins\":[") != std::string::npos,
          "histogram must serialize bins");
-  ASSERT(counts_total(block) > 0, "histogram counts must sum to > 0");
-  ASSERT(block.find("\"count\":") == std::string::npos,
-         "histogram must not serialize count");
-  ASSERT(block.find("\"sum\":") == std::string::npos,
-         "histogram must not serialize sum");
-  ASSERT(block.find("\"min\":") == std::string::npos,
-         "histogram must not serialize min");
-  ASSERT(block.find("\"max\":") == std::string::npos,
-         "histogram must not serialize max");
+  const uint64_t total = counts_total(block);
+  ASSERT(total >= min_count, "histogram counts must cover every recorded value");
+  if (total > 0) {
+    char expect[64];
+    std::snprintf(expect, sizeof(expect), "\"count\":%llu,",
+                  static_cast<unsigned long long>(total));
+    ASSERT(block.find(expect) != std::string::npos,
+           "histogram count must equal the sum of the bin counts");
+    ASSERT(block.find("\"sum\":") != std::string::npos, "histogram must serialize sum");
+    ASSERT(block.find("\"min\":") != std::string::npos, "histogram must serialize min");
+    ASSERT(block.find("\"max\":") != std::string::npos, "histogram must serialize max");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,8 +276,26 @@ __global__ void gs_test_kernel_b(float* data, int n) {
   }
 }
 
+// Launched only from inside a captured HIP graph.
+__global__ void gs_test_kernel_graph(float* data, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    data[idx] = data[idx] + 1.0f;
+  }
+}
+
+// GRAPHSIGNAL_ROCM_KERNEL_TRACE=all enables per-kernel tracing; the default
+// (none) must leave rocm_kernels_nanoseconds empty while everything else —
+// memcpy, HIP sync, probes — is still collected. Makefile.rocm runs both.
+static bool kernel_trace_enabled() {
+  const char* s = std::getenv("GRAPHSIGNAL_ROCM_KERNEL_TRACE");
+  return s && std::strcmp(s, "all") == 0;
+}
+
 int main() {
-  std::printf("Running rocm_activity tests...\n");
+  const bool kernel_trace = kernel_trace_enabled();
+  std::printf("Running rocm_activity tests (kernel trace: %s)...\n",
+              kernel_trace ? "all" : "none");
 
   int device_count = 0;
   hipError_t st = hipGetDeviceCount(&device_count);
@@ -313,8 +344,12 @@ int main() {
   // ------------------------------------------------------------------ memcpy
   // Pinned host memory so every copy is a real DMA transfer reported by the
   // MEMORY_COPY tracing service (pageable copies may be staged differently).
+  // The copies are multi-megabyte on purpose: the HIP runtime executes a
+  // small copy (a few KB on MI300X) as a blit KERNEL (__amd_rocclr_copyBuffer),
+  // which rocprofiler-sdk reports as a kernel dispatch — those land in
+  // rocm_kernels_nanoseconds under that symbol, not in the memcpy instruments.
   CASE("memcpy H2D/D2H with known byte totals");
-  const int n = 1024;
+  const int n = 1 << 20;
   const size_t copy_bytes = n * sizeof(float);
   const int kH2DCopies = 3;
   const int kD2HCopies = 2;
@@ -367,6 +402,32 @@ int main() {
   HIP_OK(hipEventDestroy(event), "hipEventDestroy failed");
   HIP_OK(hipStreamDestroy(stream), "hipStreamDestroy failed");
 
+  // --------------------------------------------------------------- HIP graph
+  // Kernels replayed from a HIP graph arrive as ordinary kernel dispatch
+  // records (rocprofiler-sdk has no graph-level record, unlike CUPTI's
+  // GRAPH_TRACE), so a graph-only symbol must land in rocm_kernels_nanoseconds
+  // with one sample per replay — and the replay must not disturb the tool.
+  CASE("HIP graph capture + replay");
+  const int kGraphReplays = 5;
+  hipStream_t graph_stream = nullptr;
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t graph_exec = nullptr;
+  HIP_OK(hipStreamCreate(&graph_stream), "hipStreamCreate (graph) failed");
+  HIP_OK(hipStreamBeginCapture(graph_stream, hipStreamCaptureModeGlobal),
+         "hipStreamBeginCapture failed");
+  gs_test_kernel_graph<<<blocks, threads_per_block, 0, graph_stream>>>(d_data, n);
+  HIP_OK(hipGetLastError(), "captured kernel launch failed");
+  HIP_OK(hipStreamEndCapture(graph_stream, &graph), "hipStreamEndCapture failed");
+  HIP_OK(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+         "hipGraphInstantiate failed");
+  for (int i = 0; i < kGraphReplays; ++i) {
+    HIP_OK(hipGraphLaunch(graph_exec, graph_stream), "hipGraphLaunch failed");
+  }
+  HIP_OK(hipStreamSynchronize(graph_stream), "sync after graph replays failed");
+  HIP_OK(hipGraphExecDestroy(graph_exec), "hipGraphExecDestroy failed");
+  HIP_OK(hipGraphDestroy(graph), "hipGraphDestroy failed");
+  HIP_OK(hipStreamDestroy(graph_stream), "hipStreamDestroy (graph) failed");
+
   HIP_OK(hipFree(d_data), "hipFree failed");
   HIP_OK(hipHostFree(h_data), "hipHostFree failed");
 
@@ -379,17 +440,20 @@ int main() {
   const auto poll_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
   while (std::chrono::steady_clock::now() < poll_deadline) {
     json = read_shm_json();
-    if (json.find("gs_test_kernel_b") != std::string::npos &&
+    if (json.find("\"host_to_device\"") != std::string::npos &&
         json.find("hipEventSynchronize") != std::string::npos &&
         json.find("gstest_batch_duration") != std::string::npos &&
         json.find("gstest_host_profile") != std::string::npos) {
-      // Candidate snapshot; verify both kernels' cumulative time has landed.
+      if (!kernel_trace) break;
+      // Candidate snapshot; verify every kernel's cumulative time has landed.
       std::vector<std::string> blocks_now = metric_blocks(json);
       std::string kernels_now =
           find_metric(blocks_now, "rocm_kernels_nanoseconds", "gs_test_kernel_a");
       if (!kernels_now.empty() &&
           frame_value_containing(kernels_now, "gs_test_kernel_a") > 0 &&
-          frame_value_containing(kernels_now, "gs_test_kernel_b") > 0) {
+          frame_value_containing(kernels_now, "gs_test_kernel_b") > 0 &&
+          frame_samples_containing(kernels_now, "gs_test_kernel_graph") >=
+              static_cast<uint64_t>(kGraphReplays)) {
         break;
       }
     }
@@ -411,17 +475,37 @@ int main() {
 
   std::vector<std::string> blocks_v = metric_blocks(json);
 
+  // The mode gauge says which mode produced the snapshot.
+  const std::string mode_gauge =
+      find_metric(blocks_v, "rocm_kernel_trace_mode", "\"type\":\"gauge\"");
+  ASSERT(!mode_gauge.empty(), "rocm_kernel_trace_mode gauge missing");
+  ASSERT(block_u64(mode_gauge, "value") == (kernel_trace ? 1u : 0u),
+         "rocm_kernel_trace_mode must report the mode in effect");
+
   // Kernels: one profile instrument; frames keyed by kernel symbol, values =
-  // cumulative duration ns.
+  // cumulative duration ns — only with kernel tracing on. With it off the
+  // instrument exists but no dispatch is ever recorded into it.
   const std::string kernels =
       find_metric(blocks_v, "rocm_kernels_nanoseconds", "\"frames\":{");
   ASSERT(!kernels.empty(), "rocm_kernels_nanoseconds profile missing");
   ASSERT(kernels.find("\"type\":\"profile\"") != std::string::npos,
          "rocm_kernels_nanoseconds must serialize as a profile");
-  ASSERT(frame_value_containing(kernels, "gs_test_kernel_a") > 0,
-         "rocm_kernels_nanoseconds frame for gs_test_kernel_a missing");
-  ASSERT(frame_value_containing(kernels, "gs_test_kernel_b") > 0,
-         "rocm_kernels_nanoseconds frame for gs_test_kernel_b missing");
+  if (kernel_trace) {
+    ASSERT(frame_value_containing(kernels, "gs_test_kernel_a") > 0,
+           "rocm_kernels_nanoseconds frame for gs_test_kernel_a missing");
+    ASSERT(frame_value_containing(kernels, "gs_test_kernel_b") > 0,
+           "rocm_kernels_nanoseconds frame for gs_test_kernel_b missing");
+    ASSERT(frame_value_containing(kernels, "gs_test_kernel_graph") > 0,
+           "rocm_kernels_nanoseconds frame for the graph-replayed kernel missing");
+    ASSERT(frame_samples_containing(kernels, "gs_test_kernel_graph") ==
+               static_cast<uint64_t>(kGraphReplays),
+           "graph-replayed kernel must be sampled once per replay");
+  } else {
+    ASSERT(parse_frames(kernels).empty(),
+           "rocm_kernels_nanoseconds must stay empty without --rocm-kernel-trace all");
+    ASSERT(json.find("gs_test_kernel") == std::string::npos,
+           "no kernel symbol may appear without kernel tracing");
+  }
 
   // Memcpy: per-kind duration frames + exact cumulative byte totals.
   const std::string memcpy_prof =
@@ -459,14 +543,18 @@ int main() {
          "rocm_sync_nanoseconds frame for hipEventSynchronize missing");
 
   // Host histogram probe: discovered from the probe.h registry, serialized
-  // with its tags and ONLY bins/counts. 100/200/300 land in the log-linear
-  // bins with lower bounds 96/192/256, one observation each.
+  // with its tags, bins/counts and the exact aggregates. 100/200/300 land in
+  // the log-linear bins with lower bounds 96/192/256, one observation each.
   const std::string probe_block = find_metric(
       blocks_v, "gstest_batch_duration", "\"stage\":\"decode\"");
-  assert_histogram_sane(probe_block, "host probe gstest_batch_duration missing");
+  assert_histogram_sane(probe_block, 3, "host probe gstest_batch_duration missing");
   ASSERT(probe_block.find("\"bins\":[96,192,256],\"counts\":[1,1,1]") !=
              std::string::npos,
          "host probe bins/counts must match the recorded values exactly");
+  ASSERT(block_u64(probe_block, "count") == 3, "host probe count must be 3");
+  ASSERT(block_u64(probe_block, "sum") == 600, "host probe sum must be 600");
+  ASSERT(block_u64(probe_block, "min") == 100, "host probe min must be 100");
+  ASSERT(block_u64(probe_block, "max") == 300, "host probe max must be 300");
 
   // Host profile probe: frames with exact cumulative values.
   const std::string profile_block =

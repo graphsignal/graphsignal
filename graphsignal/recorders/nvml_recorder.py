@@ -6,7 +6,16 @@ import socket
 import graphsignal
 import graphsignal.watcher
 from graphsignal.recorders.base_recorder import BaseRecorder
-from pynvml import *
+
+# nvidia-ml-py is a declared dependency, but the profiler is routinely
+# installed with --no-deps into a container somebody else built, and an AMD
+# image has no reason to carry it. A missing module disables this recorder
+# only; the watcher wires the others regardless.
+try:
+    from pynvml import *
+    _NVML_IMPORT_ERROR = None
+except Exception as _exc:
+    _NVML_IMPORT_ERROR = _exc
 
 # after pynvml import to avoid import conflicts
 from typing import Any, Dict, List, Optional, Union
@@ -47,6 +56,10 @@ class NVMLRecorder(BaseRecorder):
         self._current_device_idxs: list[int] = []
 
     def setup(self):
+        if _NVML_IMPORT_ERROR is not None:
+            logger.debug('pynvml not importable (%s), skipping GPU usage',
+                         _NVML_IMPORT_ERROR)
+            return
         try:
             nvmlInit()
             self._is_initialized = True

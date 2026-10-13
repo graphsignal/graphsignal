@@ -113,43 +113,43 @@ class ExtractFlagsTest(unittest.TestCase):
     def test_no_flags(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(['vllm', 'serve']),
-            (None, None, None, None, ['vllm', 'serve']))
+            (None, None, None, None, None, ['vllm', 'serve']))
 
     def test_extracts_metrics_port_space_form(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--metrics-port', '8000', 'trtllm-serve', 'm']),
-            (8000, None, None, None, ['trtllm-serve', 'm']))
+            (8000, None, None, None, None, ['trtllm-serve', 'm']))
 
     def test_extracts_metrics_port_equals_form(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--metrics-port=8000', 'trtllm-serve', 'm']),
-            (8000, None, None, None, ['trtllm-serve', 'm']))
+            (8000, None, None, None, None, ['trtllm-serve', 'm']))
 
     def test_extracts_listen_port_space_form(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--listen-port', '18400', 'vllm', 'serve']),
-            (None, None, 18400, None, ['vllm', 'serve']))
+            (None, None, 18400, None, None, ['vllm', 'serve']))
 
     def test_extracts_listen_port_equals_form(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--listen-port=18400', 'vllm', 'serve']),
-            (None, None, 18400, None, ['vllm', 'serve']))
+            (None, None, 18400, None, None, ['vllm', 'serve']))
 
     def test_extracts_listen_host_space_form(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--listen-host', '0.0.0.0', 'vllm', 'serve']),
-            (None, '0.0.0.0', None, None, ['vllm', 'serve']))
+            (None, '0.0.0.0', None, None, None, ['vllm', 'serve']))
 
     def test_extracts_listen_host_equals_form(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--listen-host=10.0.0.5', 'vllm', 'serve']),
-            (None, '10.0.0.5', None, None, ['vllm', 'serve']))
+            (None, '10.0.0.5', None, None, None, ['vllm', 'serve']))
 
     def test_listen_host_missing_value_exits(self):
         with self.assertRaises(SystemExit):
@@ -160,13 +160,13 @@ class ExtractFlagsTest(unittest.TestCase):
             graphsignal_run._extract_graphsignal_flags(
                 ['--listen-port', '18400', '--metrics-port', '9001',
                  'vllm', 'serve']),
-            (9001, None, 18400, None, ['vllm', 'serve']))
+            (9001, None, 18400, None, None, ['vllm', 'serve']))
 
     def test_unknown_leading_token_starts_workload_command(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['python', '--metrics-port', '8000']),
-            (None, None, None, None, ['python', '--metrics-port', '8000']))
+            (None, None, None, None, None, ['python', '--metrics-port', '8000']))
 
     def test_flags_after_command_left_for_workload(self):
         # Only leading flags are parsed; identically named workload flags
@@ -174,11 +174,11 @@ class ExtractFlagsTest(unittest.TestCase):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['vllm', 'serve', '--metrics-port', '8000']),
-            (None, None, None, None, ['vllm', 'serve', '--metrics-port', '8000']))
+            (None, None, None, None, None, ['vllm', 'serve', '--metrics-port', '8000']))
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['vllm', 'serve', '--listen-port', '18400']),
-            (None, None, None, None, ['vllm', 'serve', '--listen-port', '18400']))
+            (None, None, None, None, None, ['vllm', 'serve', '--listen-port', '18400']))
 
     def test_invalid_metrics_port_exits(self):
         with self.assertRaises(SystemExit):
@@ -205,12 +205,14 @@ class MainFlagForwardingTest(unittest.TestCase):
         orig_init = VllmLauncher.__init__
 
         def capture_init(self, args, metrics_port=None, listen_host=None,
-                         listen_port=None, cuda_graph_trace=None):
+                         listen_port=None, cuda_graph_trace=None,
+                         rocm_kernel_trace=None):
             created.append((list(args), metrics_port, listen_host, listen_port,
-                            cuda_graph_trace))
+                            cuda_graph_trace, rocm_kernel_trace))
             return orig_init(self, args, metrics_port=metrics_port,
                              listen_host=listen_host, listen_port=listen_port,
-                             cuda_graph_trace=cuda_graph_trace)
+                             cuda_graph_trace=cuda_graph_trace,
+                             rocm_kernel_trace=rocm_kernel_trace)
 
         with patch.object(VllmLauncher, '__init__', capture_init), \
              patch.object(VllmLauncher, 'match', return_value=True), \
@@ -221,19 +223,21 @@ class MainFlagForwardingTest(unittest.TestCase):
                            '--listen-port', '18400', 'vllm', 'serve']):
             graphsignal_run.main()
 
-        self.assertEqual(created, [(['vllm', 'serve'], 9001, '0.0.0.0', 18400, None)])
+        self.assertEqual(created, [(['vllm', 'serve'], 9001, '0.0.0.0', 18400, None, None)])
 
     def test_main_passes_none_flags_when_absent(self):
         created = []
         orig_init = VllmLauncher.__init__
 
         def capture_init(self, args, metrics_port=None, listen_host=None,
-                         listen_port=None, cuda_graph_trace=None):
+                         listen_port=None, cuda_graph_trace=None,
+                         rocm_kernel_trace=None):
             created.append((metrics_port, listen_host, listen_port,
-                            cuda_graph_trace))
+                            cuda_graph_trace, rocm_kernel_trace))
             return orig_init(self, args, metrics_port=metrics_port,
                              listen_host=listen_host, listen_port=listen_port,
-                             cuda_graph_trace=cuda_graph_trace)
+                             cuda_graph_trace=cuda_graph_trace,
+                             rocm_kernel_trace=rocm_kernel_trace)
 
         with patch.object(VllmLauncher, '__init__', capture_init), \
              patch.object(VllmLauncher, 'match', return_value=True), \
@@ -241,18 +245,20 @@ class MainFlagForwardingTest(unittest.TestCase):
              patch.object(sys, 'argv', ['graphsignal-run', 'vllm', 'serve']):
             graphsignal_run.main()
 
-        self.assertEqual(created, [(None, None, None, None)])
+        self.assertEqual(created, [(None, None, None, None, None)])
 
     def test_main_passes_cuda_graph_trace_to_launchers(self):
         created = []
         orig_init = VllmLauncher.__init__
 
         def capture_init(self, args, metrics_port=None, listen_host=None,
-                         listen_port=None, cuda_graph_trace=None):
-            created.append((list(args), cuda_graph_trace))
+                         listen_port=None, cuda_graph_trace=None,
+                         rocm_kernel_trace=None):
+            created.append((list(args), cuda_graph_trace, rocm_kernel_trace))
             return orig_init(self, args, metrics_port=metrics_port,
                              listen_host=listen_host, listen_port=listen_port,
-                             cuda_graph_trace=cuda_graph_trace)
+                             cuda_graph_trace=cuda_graph_trace,
+                             rocm_kernel_trace=rocm_kernel_trace)
 
         with patch.object(VllmLauncher, '__init__', capture_init), \
              patch.object(VllmLauncher, 'match', return_value=True), \
@@ -262,7 +268,30 @@ class MainFlagForwardingTest(unittest.TestCase):
                            'vllm', 'serve']):
             graphsignal_run.main()
 
-        self.assertEqual(created, [(['vllm', 'serve'], 'node')])
+        self.assertEqual(created, [(['vllm', 'serve'], 'node', None)])
+
+    def test_main_passes_rocm_kernel_trace_to_launchers(self):
+        created = []
+        orig_init = VllmLauncher.__init__
+
+        def capture_init(self, args, metrics_port=None, listen_host=None,
+                         listen_port=None, cuda_graph_trace=None,
+                         rocm_kernel_trace=None):
+            created.append((list(args), cuda_graph_trace, rocm_kernel_trace))
+            return orig_init(self, args, metrics_port=metrics_port,
+                             listen_host=listen_host, listen_port=listen_port,
+                             cuda_graph_trace=cuda_graph_trace,
+                             rocm_kernel_trace=rocm_kernel_trace)
+
+        with patch.object(VllmLauncher, '__init__', capture_init), \
+             patch.object(VllmLauncher, 'match', return_value=True), \
+             patch.object(VllmLauncher, 'launch'), \
+             patch.object(sys, 'argv',
+                          ['graphsignal-run', '--rocm-kernel-trace', 'all',
+                           'vllm', 'serve']):
+            graphsignal_run.main()
+
+        self.assertEqual(created, [(['vllm', 'serve'], None, 'all')])
 
 
 class CudaGraphTraceFlagTest(unittest.TestCase):
@@ -274,32 +303,32 @@ class CudaGraphTraceFlagTest(unittest.TestCase):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--cuda-graph-trace', 'node', 'vllm', 'serve']),
-            (None, None, None, 'node', ['vllm', 'serve']))
+            (None, None, None, 'node', None, ['vllm', 'serve']))
 
     def test_equals_form(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--cuda-graph-trace=node', 'vllm', 'serve']),
-            (None, None, None, 'node', ['vllm', 'serve']))
+            (None, None, None, 'node', None, ['vllm', 'serve']))
 
     def test_graph_value_accepted(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--cuda-graph-trace', 'graph', 'vllm', 'serve']),
-            (None, None, None, 'graph', ['vllm', 'serve']))
+            (None, None, None, 'graph', None, ['vllm', 'serve']))
 
     def test_value_is_case_insensitive_and_trimmed(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--cuda-graph-trace=  NODE ', 'vllm', 'serve']),
-            (None, None, None, 'node', ['vllm', 'serve']))
+            (None, None, None, 'node', None, ['vllm', 'serve']))
 
     def test_combines_with_other_leading_flags(self):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['--listen-port', '18400', '--cuda-graph-trace', 'node',
                  '--metrics-port', '9001', 'vllm', 'serve']),
-            (9001, None, 18400, 'node', ['vllm', 'serve']))
+            (9001, None, 18400, 'node', None, ['vllm', 'serve']))
 
     def test_invalid_value_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as cm:
@@ -316,8 +345,57 @@ class CudaGraphTraceFlagTest(unittest.TestCase):
         self.assertEqual(
             graphsignal_run._extract_graphsignal_flags(
                 ['vllm', 'serve', '--cuda-graph-trace', 'node']),
-            (None, None, None, None,
+            (None, None, None, None, None,
              ['vllm', 'serve', '--cuda-graph-trace', 'node']))
+
+
+class RocmKernelTraceFlagTest(unittest.TestCase):
+    """`--rocm-kernel-trace {none|all}` switches per-kernel tracing on ROCm.
+    Consumed by graphsignal-run, never forwarded, and handed to the native
+    library through GRAPHSIGNAL_ROCM_KERNEL_TRACE."""
+
+    def test_space_form(self):
+        self.assertEqual(
+            graphsignal_run._extract_graphsignal_flags(
+                ['--rocm-kernel-trace', 'all', 'vllm', 'serve']),
+            (None, None, None, None, 'all', ['vllm', 'serve']))
+
+    def test_equals_form_and_none(self):
+        self.assertEqual(
+            graphsignal_run._extract_graphsignal_flags(
+                ['--rocm-kernel-trace=none', 'vllm', 'serve']),
+            (None, None, None, None, 'none', ['vllm', 'serve']))
+
+    def test_value_is_case_insensitive_and_trimmed(self):
+        self.assertEqual(
+            graphsignal_run._extract_graphsignal_flags(
+                ['--rocm-kernel-trace=  ALL ', 'vllm', 'serve']),
+            (None, None, None, None, 'all', ['vllm', 'serve']))
+
+    def test_combines_with_other_leading_flags(self):
+        self.assertEqual(
+            graphsignal_run._extract_graphsignal_flags(
+                ['--cuda-graph-trace', 'node', '--rocm-kernel-trace', 'all',
+                 '--listen-port', '18400', 'vllm', 'serve']),
+            (None, None, 18400, 'node', 'all', ['vllm', 'serve']))
+
+    def test_invalid_value_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as cm:
+            graphsignal_run._extract_graphsignal_flags(
+                ['--rocm-kernel-trace', 'on', 'vllm', 'serve'])
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_missing_value_is_a_usage_error(self):
+        with self.assertRaises(SystemExit) as cm:
+            graphsignal_run._extract_graphsignal_flags(['--rocm-kernel-trace'])
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_flag_after_command_left_for_workload(self):
+        self.assertEqual(
+            graphsignal_run._extract_graphsignal_flags(
+                ['vllm', 'serve', '--rocm-kernel-trace', 'all']),
+            (None, None, None, None, None,
+             ['vllm', 'serve', '--rocm-kernel-trace', 'all']))
 
 
 class CudaGraphTraceEnvVarTest(unittest.TestCase):

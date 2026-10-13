@@ -21,7 +21,8 @@ class FallbackLauncher(BaseLauncher):
             sys.exit(1)
 
         CuptiProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace)
-        RocmProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace)
+        RocmProfiler.setup_env_vars(cuda_graph_trace=self.cuda_graph_trace,
+                                    rocm_kernel_trace=self.rocm_kernel_trace)
 
         # Generic workloads have no known metrics port; only scrape when the
         # user passed --metrics-port (or the workload itself takes a --port).

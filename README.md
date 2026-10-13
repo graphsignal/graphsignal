@@ -6,7 +6,7 @@ Graphsignal is a GPU profiler for AI agents to autonomously optimize inference p
 
 * GPU activity profiles via CUPTI/ROCm injection: cumulative time per kernel, per CUDA graph, and per memcpy/memset/synchronization kind, plus transfer byte counters.
 * GPU probes: a vendorable C++ header to instrument code and kernels — by hand, or by an agent.
-* GPU telemetry via NVML: utilization, memory, power, clocks, throttling, NVLink/PCIe throughput, XID errors.
+* GPU telemetry via NVML (NVIDIA) and AMD SMI (ROCm): utilization, memory, power, temperature, clocks, throttling, NVLink/PCIe throughput, XID and ECC errors.
 * Process and host metrics: CPU, memory, command lines, runtimes.
 * Inference engine metrics imported from Prometheus endpoints (vLLM, SGLang, TensorRT-LLM).
 * Error capture from engine console output, including crashes and tracebacks.
@@ -69,6 +69,7 @@ Options (before the command):
 | `--listen-host HOST` | Host to bind the `/signals` endpoint to (default: `127.0.0.1`). Set e.g. `0.0.0.0` to expose it for remote access — anything on that network can then read it. |
 | `--listen-port PORT` | Port for the `/signals` endpoint (default: `18259`). |
 | `--cuda-graph-trace {graph\|node}` | Granularity for CUDA graph launches (default: `graph`). `graph` times each replay as a whole into `cuda_graphs_nanoseconds`; `node` times the kernels inside the graph individually into `cuda_kernels_nanoseconds`. Also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`; the flag wins. |
+| `--rocm-kernel-trace {none\|all}` | Per-kernel tracing on ROCm (default: `none`). `all` times every kernel dispatch into `rocm_kernels_nanoseconds`. rocprofiler-sdk charges tens of microseconds per dispatch for it, so this is an investigation mode, not for production (see [Overhead](#overhead)). Also settable via `GRAPHSIGNAL_ROCM_KERNEL_TRACE`; the flag wins. |
 
 Engine notes: the SGLang launcher adds `--enable-metrics` so the Prometheus endpoint is available; the vLLM launcher removes `--disable-log-stats` for the same reason. Everything else on the command line is passed through unchanged.
 
@@ -104,7 +105,7 @@ graphsignal-top
 
 <img src="assets/graphsignal-top.png" alt="graphsignal-top: GPU utilization and memory, engine throughput and latency, GPU time breakdown, and kernels ranked by time for Qwen3-32B on two RTX PRO 6000s under SGLang" width="100%">
 
-Per GPU: utilization over time, memory, power, temperature, clocks, PCIe traffic, XID errors and throttling, all from the NVML telemetry. The engine block comes from the scraped Prometheus metrics: running and waiting requests, KV-cache usage, token throughput over time, and TTFT / TPOT / end-to-end latency quantiles. Rates and the kernel ranking cover the last 5 seconds (`--window`). Kernels are named by a built-in taxonomy; the details view (`⏎`) shows the full mangled symbol, the totals since start, and the per-process split. `g`, `m` and `s` switch the table to CUDA graph replays, memory transfers and host synchronization.
+Per GPU: utilization over time, memory, power, temperature, clocks, PCIe traffic, XID errors and throttling, all from the NVML (or AMD SMI) telemetry. The engine block comes from the scraped Prometheus metrics: running and waiting requests, KV-cache usage, token throughput over time, and TTFT / TPOT / end-to-end latency quantiles. Rates and the kernel ranking cover the last 5 seconds (`--window`). Kernels are named by a built-in taxonomy; the details view (`⏎`) shows the full mangled symbol, the totals since start, and the per-process split. `g`, `m` and `s` switch the table to CUDA graph replays, memory transfers and host synchronization.
 
 A workload on another machine is one flag away, provided its profiler was started with `--listen-host`:
 
@@ -210,6 +211,7 @@ Three collection modes, in the order you should reach for them:
 
 * **Kernels** (default) — just `graphsignal-run`. Cheap enough to leave on, including in production.
 * **Graph node trace** — `--cuda-graph-trace node`, when the default mode puts all the GPU time in `cuda_graphs_nanoseconds` and you need it per kernel. Run it for the investigation, then go back to the default.
+* **ROCm kernel trace** — `--rocm-kernel-trace all`, the ROCm counterpart: by default the ROCm library collects transfers, synchronization, device telemetry and engine metrics but no per-kernel time, because rocprofiler-sdk intercepts the completion of every traced dispatch at tens of microseconds each, graph-replayed or not (measured ~50 µs on an MI300X VF, 6 → 27 ms per decode token on a small model). Switch it on to rank kernels, read the profile, switch it off. Not for production.
 * **GPU probes** — instrument the code with [probe.h](include/graphsignal/probe.h), once a kernel is named and the question is which part of it. Safe to leave in production; cost follows how densely you record.
 
 What each mode costs, measured, and the method behind the numbers: [Profiler Overhead guide](https://graphsignal.com/docs/guides/profiler-overhead/).

@@ -122,6 +122,17 @@ def _header(state, ui, width):
                     break
     elif header.graph_trace_mode == 'node':
         second.append(('  cuda graph trace: node', 'label'))
+    elif header.rocm_kernel_trace == 'none':
+        second.append(('  rocm kernel trace: none', 'label'))
+        if ui.tab == 'kernels':
+            used = sum(len(t) for t, _ in second)
+            for note in ('  (kernels are not traced; --rocm-kernel-trace all lists them, at a cost)',
+                         '  (not traced; --rocm-kernel-trace all)'):
+                if used + len(note) <= width:
+                    second.append((note, 'dim'))
+                    break
+    elif header.rocm_kernel_trace == 'all':
+        second.append(('  rocm kernel trace: all', 'label'))
     elif header.rocm:
         second.append(('  rocm', 'label'))
     lines.append(_clip(second, width))

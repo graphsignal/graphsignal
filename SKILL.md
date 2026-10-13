@@ -46,6 +46,7 @@ Leading flags (before the command):
 - `--listen-host HOST` — host to bind the `/signals` endpoint to (default `127.0.0.1`; set e.g. `0.0.0.0` to expose it for remote access; also settable via `GRAPHSIGNAL_LISTEN_HOST`).
 - `--listen-port PORT` — port for the `/signals` endpoint (default `18259`; also settable via `GRAPHSIGNAL_LISTEN_PORT`).
 - `--cuda-graph-trace {graph|node}` — granularity for CUDA graph launches (default `graph`; also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`). `graph` times each graph replay as a whole into `cuda_graphs_nanoseconds`. `node` times the kernels *inside* the graph individually into `cuda_kernels_nanoseconds` and leaves `cuda_graphs_nanoseconds` empty — that is how you rank kernels in an engine that replays CUDA graphs (vLLM, SGLang, TensorRT-LLM, llama.cpp in decode). It needs no extra privileges; it costs more CUPTI work per replay, so use it for an investigation, not for a long-running production run. Ignored on ROCm, where every dispatch is reported individually anyway.
+- `--rocm-kernel-trace {none|all}` — per-kernel tracing on ROCm (default `none`; also settable via `GRAPHSIGNAL_ROCM_KERNEL_TRACE`). With `none`, `rocm_kernels_nanoseconds` stays empty and the payload still carries transfers, synchronization, AMD SMI telemetry and engine metrics. With `all`, every kernel dispatch is timed into `rocm_kernels_nanoseconds`, graph-replayed or not — and rocprofiler-sdk charges tens of microseconds per dispatch for it (~50 µs on an MI300X VF), so **use it for an investigation only, never in production**. The `rocm_kernel_trace_mode` gauge (0 none, 1 all) says which mode produced a payload. On ROCm 7.2 and earlier (rocprofiler-sdk 1.1) `all` also crashes a workload that replays HIP graphs; run it eager there (SGLang `--disable-cuda-graph`, vLLM `--enforce-eager`) or use ROCm 10+ — `graphsignal-run` warns at launch.
 
 Set `GRAPHSIGNAL_DEBUG=1` for verbose diagnostics.
 
@@ -153,7 +154,7 @@ Then read `http://127.0.0.1:18259/signals` locally either way. On Linux, `docker
 - `cuda_graphs_nanoseconds` — profile of cumulative replay time per unique CUDA-graph structure (frames are 16-hex structural signatures). Empty in node mode.
 - `cuda_graph_trace_mode` — gauge, the graph tracing granularity in effect: `0` = graph (default), `1` = node. Read it before concluding anything from an empty `cuda_graphs_nanoseconds` or a sparse `cuda_kernels_nanoseconds`.
 - `cuda_memcpy_nanoseconds` / `cuda_memset_nanoseconds` / `cuda_sync_nanoseconds` — profiles of cumulative time per transfer kind / sync type; `cuda_memcpy_bytes{kind}` / `cuda_memset_bytes{kind}` counters carry the volumes.
-- `gpu_*` — NVML telemetry per device (utilization, memory, power, clocks, throttling, NVLink/PCIe, `gpu_xid_critical_errors`).
+- `gpu_*` — device telemetry per GPU, from NVML on NVIDIA and AMD SMI on ROCm, under the same names (utilization, memory, power, temperature, clocks, throttling, PCIe, ECC; NVLink and `gpu_xid_critical_errors` are NVIDIA-only).
 - `process_*`, `host_*` — CPU/memory per process and host.
 - Engine metrics scraped from Prometheus (vLLM `vllm:*`, SGLang `sglang:*`, TRT-LLM) appear under their original names. Both `histogram` and `summary` families become one Graphsignal histogram: exact `count`/`sum` always, plus `p50`/`p95` where the family exposes `le` buckets.
 - User probe metrics (see GPU probes below) appear under their registered names.
@@ -177,6 +178,7 @@ Three collection modes, cheapest first. All three are privilege-free — none of
 |---|---|---|---|
 | **Kernels** (default) | just `graphsignal-run` | on a GPU-bound workload, within run-to-run noise; a few percent at most on one that launches many small kernels per second | always, including long production runs |
 | **Graph node trace** | `--cuda-graph-trace node` | free on a GPU-bound workload; up to roughly ten percent on a host-bound one, because one record per replay becomes one per kernel inside it | to rank kernels in a graph-replaying engine, then switch back |
+| **ROCm kernel trace** | `--rocm-kernel-trace all` | tens of microseconds per kernel dispatch, charged by rocprofiler-sdk's completion interception, graph-replayed or not: ~50 µs each on an MI300X VF, which took a small model's decode step from 6 to 27 ms per token | to rank kernels on ROCm during an investigation, then switch back; **never in production** |
 | **GPU probes** | instrument the code | not measurable at production density (a few instruments per request/iteration); a few percent when dense enough to split one kernel into phases | **safe to ship in production**; dense instrumentation for investigation |
 
 Overhead tracks how often the workload asks the driver to do something, not model size: an engine that replays a whole decode

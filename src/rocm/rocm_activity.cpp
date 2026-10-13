@@ -5,6 +5,7 @@
 #include <rocprofiler-sdk/hip/api_id.h>
 
 #include <atomic>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +45,24 @@ constexpr size_t kBufferWatermark = 1 * 1024 * 1024;
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_debug_enabled{false};
 graphsignal::MetricsWriter* g_writer = nullptr;
+
+// Per-kernel tracing, chosen once at tool_init from
+// GRAPHSIGNAL_ROCM_KERNEL_TRACE=none|all (default none). rocprofiler-sdk
+// intercepts the completion of every traced dispatch — an interrupt-backed
+// signal and a handler-thread wakeup each, tens of microseconds on MI300X —
+// and a graph replay is unrolled into ordinary dispatches, so there is no
+// cheap granularity to fall back to as with CUPTI's graph mode. With `none`
+// the KERNEL_DISPATCH service (and the CODE_OBJECT callback that only serves
+// it) is never configured and the workload runs at native speed; memory copy
+// and HIP sync tracing stay on. Published as the rocm_kernel_trace_mode gauge
+// (0 none, 1 all) so an empty rocm_kernels_nanoseconds is never ambiguous.
+enum RocmKernelTraceMode : uint32_t { kKernelTraceNone = 0, kKernelTraceAll = 1 };
+uint32_t g_kernel_trace_mode = kKernelTraceNone;
+// An unrecognized GRAPHSIGNAL_ROCM_KERNEL_TRACE value, kept until the writer's
+// log exists so the fallback can be noted.
+std::string g_kernel_trace_env_rejected;
+graphsignal::Instrument* g_kernel_trace_mode_gauge = nullptr;
+uint32_t kernel_trace_mode_from_env();
 
 // rocprofiler handles created at tool_init.
 rocprofiler_context_id_t        g_ctx_id{0};
@@ -119,28 +138,29 @@ int hipSyncOpIndex(uint32_t op) {
   return -1;
 }
 
-// Resolve a HIP runtime API operation id to its function name (e.g.
-// "hipStreamSynchronize"), cached to avoid repeated SDK queries.
-const std::string& hipOpName(uint32_t op) {
-  static std::mutex mu;
-  static std::unordered_map<uint32_t, std::string> cache;
-  std::lock_guard<std::mutex> lock(mu);
-  auto it = cache.find(op);
-  if (it != cache.end()) return it->second;
-  const char* name = nullptr;
-  uint64_t name_len = 0;
-  std::string resolved;
-  if (rocprofiler_query_buffer_tracing_kind_operation_name(
-          ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API,
-          static_cast<rocprofiler_tracing_operation_t>(op), &name, &name_len) ==
-          ROCPROFILER_STATUS_SUCCESS &&
-      name) {
-    resolved = name;
-  } else {
-    resolved = "hip_op_" + std::to_string(op);
+// The traced ops' function names ("hipStreamSynchronize", ...), resolved ONCE
+// at tool_init by index into kHipSyncOps. The buffer callback must never call
+// back into rocprofiler-sdk: the final flush runs from tool_fini, i.e. inside
+// the SDK's own atexit finalization, and an SDK query from that callback
+// (rocprofiler_query_buffer_tracing_kind_operation_name, as a lazy cache did)
+// segfaults on rocprofiler-sdk 1.3.5 whenever a traced op first shows up in
+// that last batch — torch records its stream events while tearing down.
+std::string g_hip_sync_op_names[kNumHipSyncOps];
+
+void resolve_hip_sync_op_names() {
+  for (size_t i = 0; i < kNumHipSyncOps; ++i) {
+    const char* name = nullptr;
+    uint64_t name_len = 0;
+    if (rocprofiler_query_buffer_tracing_kind_operation_name(
+            ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API,
+            static_cast<rocprofiler_tracing_operation_t>(kHipSyncOps[i]), &name,
+            &name_len) == ROCPROFILER_STATUS_SUCCESS &&
+        name) {
+      g_hip_sync_op_names[i] = name;
+    } else {
+      g_hip_sync_op_names[i] = "hip_op_" + std::to_string(kHipSyncOps[i]);
+    }
   }
-  auto res = cache.emplace(op, std::move(resolved));
-  return res.first->second;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +224,7 @@ void handle_hip_api(const rocprofiler_buffer_tracing_hip_api_record_t* s) {
   if (idx < 0) return;
 
   graphsignal::MetricsWriter::profile_add(
-      g_sync_profile, hipOpName(s->operation).c_str(), duration);
+      g_sync_profile, g_hip_sync_op_names[idx].c_str(), duration);
 }
 
 // rocprofiler buffer-tracing callback. Delivered on our assigned callback
@@ -329,6 +349,12 @@ int tool_init(rocprofiler_client_finalize_t /*fini*/, void* /*tool_data*/) {
       return 0;
     }
 
+    g_kernel_trace_mode = kernel_trace_mode_from_env();
+    if (!g_kernel_trace_env_rejected.empty()) {
+      g_writer->debug("GRAPHSIGNAL_ROCM_KERNEL_TRACE=%s is not none|all; using none",
+                      g_kernel_trace_env_rejected.c_str());
+    }
+
     {
       std::lock_guard<std::mutex> lock(g_instruments_mu);
       g_kernels_profile = g_writer->register_instrument(
@@ -337,7 +363,13 @@ int tool_init(rocprofiler_client_finalize_t /*fini*/, void* /*tool_data*/) {
           graphsignal::InstrumentType::Profile, "rocm_memcpy_nanoseconds", {});
       g_sync_profile = g_writer->register_instrument(
           graphsignal::InstrumentType::Profile, "rocm_sync_nanoseconds", {});
+      g_kernel_trace_mode_gauge = g_writer->register_instrument(
+          graphsignal::InstrumentType::Gauge, "rocm_kernel_trace_mode", {});
     }
+    graphsignal::MetricsWriter::set(g_kernel_trace_mode_gauge,
+                                    static_cast<double>(g_kernel_trace_mode));
+
+    resolve_hip_sync_op_names();
 
     ROCP_CALL(rocprofiler_create_context(&g_ctx_id));
 
@@ -359,9 +391,11 @@ int tool_init(rocprofiler_client_finalize_t /*fini*/, void* /*tool_data*/) {
     // never flush an unallocated buffer id.
     g_writer->set_flush_hook(&flush_hook, nullptr);
 
-    ROCP_CALL(rocprofiler_configure_buffer_tracing_service(
-        g_ctx_id, ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH, nullptr, 0,
-        g_buffer_id));
+    if (g_kernel_trace_mode == kKernelTraceAll) {
+      ROCP_CALL(rocprofiler_configure_buffer_tracing_service(
+          g_ctx_id, ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH, nullptr, 0,
+          g_buffer_id));
+    }
     ROCP_CALL(rocprofiler_configure_buffer_tracing_service(
         g_ctx_id, ROCPROFILER_BUFFER_TRACING_MEMORY_COPY, nullptr, 0,
         g_buffer_id));
@@ -378,10 +412,13 @@ int tool_init(rocprofiler_client_finalize_t /*fini*/, void* /*tool_data*/) {
         kNumHipSyncOps, g_buffer_id));
 
     // CODE_OBJECT is a synchronous callback service (runs on the app thread at
-    // module load) — used only to build the kernel_id -> symbol-name map.
-    ROCP_CALL(rocprofiler_configure_callback_tracing_service(
-        g_ctx_id, ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT, nullptr, 0,
-        code_object_callback, nullptr));
+    // module load) — used only to build the kernel_id -> symbol-name map, so
+    // it is only needed when kernel dispatches are traced.
+    if (g_kernel_trace_mode == kKernelTraceAll) {
+      ROCP_CALL(rocprofiler_configure_callback_tracing_service(
+          g_ctx_id, ROCPROFILER_CALLBACK_TRACING_CODE_OBJECT, nullptr, 0,
+          code_object_callback, nullptr));
+    }
 
     // Dedicated delivery thread for the (asynchronous) buffer tracing services.
     ROCP_CALL(rocprofiler_create_callback_thread(&g_cb_thread));
@@ -389,7 +426,9 @@ int tool_init(rocprofiler_client_finalize_t /*fini*/, void* /*tool_data*/) {
 
     ROCP_CALL(rocprofiler_start_context(g_ctx_id));
 
-    g_writer->debug("rocm tool_init: writing %s", g_writer->file_path().c_str());
+    g_writer->debug("rocm tool_init: writing %s (kernel_trace_mode=%s)",
+                    g_writer->file_path().c_str(),
+                    g_kernel_trace_mode == kKernelTraceAll ? "all" : "none");
   } catch (...) {
     // Best-effort: profiling stays off; the workload runs unaffected.
     g_running.store(false, std::memory_order_relaxed);
@@ -410,6 +449,8 @@ void tool_fini(void* /*tool_data*/) {
     // contexts — an explicit stop races that teardown and returns "Context ID not
     // found" (status 2). Instead we just flip g_running=false below; any late
     // buffer_callback then bails on its own (it checks g_running first).
+    // This flush is the last SDK call; the callback it drives makes none (see
+    // resolve_hip_sync_op_names) — the SDK is mid-finalization here.
     ROCP_CALL(rocprofiler_flush_buffer(g_buffer_id));
 
     if (g_writer) g_writer->debug("rocm tool_fini: done");
@@ -431,6 +472,21 @@ uint32_t read_env_bool(const char* name) {
   if (!s || !*s) return 0;
   if (std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0) return 1;
   return 0;
+}
+
+uint32_t kernel_trace_mode_from_env() {
+  const char* s = std::getenv("GRAPHSIGNAL_ROCM_KERNEL_TRACE");
+  if (!s || !*s) return kKernelTraceNone;
+  std::string v(s);
+  // trim + lowercase, matching the CLI's normalization
+  while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+  size_t start = 0;
+  while (start < v.size() && (v[start] == ' ' || v[start] == '\t')) ++start;
+  v = v.substr(start);
+  for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (v == "all") return kKernelTraceAll;
+  if (v != "none") g_kernel_trace_env_rejected = s;
+  return kKernelTraceNone;
 }
 
 } // namespace

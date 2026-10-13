@@ -13,7 +13,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-export PATH="/usr/local/cuda/bin:$PATH"
+export PATH="/usr/local/cuda/bin:/opt/rocm/bin:$PATH"
 
 echo "--> pure C++ tests (probe, common)"
 make -f Makefile.cupti test-probe test-common test-discovery

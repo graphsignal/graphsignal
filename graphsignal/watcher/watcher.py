@@ -1,5 +1,6 @@
 from typing import Dict, Optional
 import hashlib
+import importlib
 import logging
 import os
 import time
@@ -158,11 +159,6 @@ class Watcher:
                          type(recorder).__name__, pid, exc_info=True)
 
     def on_target_created(self, args):
-        from graphsignal.recorders.host_recorder import HostRecorder
-        from graphsignal.recorders.process_recorder import ProcessRecorder
-        from graphsignal.recorders.shm_recorder import ShmRecorder
-        from graphsignal.recorders.nvml_recorder import NVMLRecorder
-        from graphsignal.recorders.prometheus_recorder import PrometheusRecorder
         from graphsignal.watcher.version_check import start_version_check
 
         # Fires here rather than at setup: this callback runs exactly once, when
@@ -171,20 +167,41 @@ class Watcher:
         # because this one is the pid monitor's poll loop.
         start_version_check(self._api_base, self._tick_stop_event)
 
-        recorders = []
-        recorders.append(HostRecorder(
-            root_pid=self._target_pid, pid=self._target_pid, args=args))
-        recorders.append(NVMLRecorder(
-            root_pid=self._target_pid, pid=self._target_pid, args=args))
+        # Each recorder is imported and constructed on its own: an import that
+        # fails (a vendor library absent from this install) or a constructor
+        # that raises must cost that one recorder, never the ones after it.
+        def create(module_name, class_name, **kwargs):
+            try:
+                module = importlib.import_module(module_name)
+                cls = getattr(module, class_name)
+                return cls(root_pid=self._target_pid, pid=self._target_pid,
+                           args=args, **kwargs)
+            except Exception:
+                logger.error('Failed to create recorder %s for target pid %s',
+                             class_name, self._target_pid, exc_info=True)
+                return None
+
+        # HostRecorder goes first: it sets the host tags.
+        specs = [
+            ('graphsignal.recorders.host_recorder', 'HostRecorder', {}),
+            ('graphsignal.recorders.nvml_recorder', 'NVMLRecorder', {}),
+            ('graphsignal.recorders.amdsmi_recorder', 'AmdSmiRecorder', {}),
+        ]
         if self._metrics_port is not None:
-            recorders.append(PrometheusRecorder(
-                root_pid=self._target_pid, pid=self._target_pid, args=args,
-                metrics_port=self._metrics_port,
-                metrics_path=self._metrics_path, metrics_host=self._metrics_host))
-        recorders.append(ProcessRecorder(
-            root_pid=self._target_pid, pid=self._target_pid, args=args))
-        recorders.append(ShmRecorder(
-            root_pid=self._target_pid, pid=self._target_pid, args=args))
+            specs.append((
+                'graphsignal.recorders.prometheus_recorder', 'PrometheusRecorder',
+                dict(metrics_port=self._metrics_port,
+                     metrics_path=self._metrics_path,
+                     metrics_host=self._metrics_host)))
+        specs.extend([
+            ('graphsignal.recorders.process_recorder', 'ProcessRecorder', {}),
+            ('graphsignal.recorders.shm_recorder', 'ShmRecorder', {}),
+        ])
+        recorders = []
+        for module_name, class_name, kwargs in specs:
+            recorder = create(module_name, class_name, **kwargs)
+            if recorder is not None:
+                recorders.append(recorder)
 
         # Extend (not replace): a LogRecorder registered earlier by
         # on_target_known already lives in this list.

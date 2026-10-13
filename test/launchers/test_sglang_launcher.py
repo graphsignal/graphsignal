@@ -53,7 +53,7 @@ class SglangLaunchTest(unittest.TestCase):
             launcher.launch()
 
         fx.cupti_env_m.assert_called_once_with(cuda_graph_trace=None)
-        fx.rocm_env_m.assert_called_once_with(cuda_graph_trace=None)
+        fx.rocm_env_m.assert_called_once_with(cuda_graph_trace=None, rocm_kernel_trace=None)
         # No --port in argv → falls back to SGLang's default serving port (30000).
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'serve', '--enable-metrics'],

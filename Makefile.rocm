@@ -12,6 +12,9 @@ SHELL := /usr/bin/env bash
 #   make -f Makefile.rocm rocm ROCM_MAJOR=7
 #   make -f Makefile.rocm rocm-install ROCM_MAJOR=7
 #
+# Prebuilt wheel artifacts (one per ROCm major; no GPU needed):
+#   make -f Makefile.rocm rocm-buildx rocm-buildx-install
+#
 # Tests:
 #   make -f Makefile.rocm test-probe                       # pure C++, no GPU
 #   make -f Makefile.rocm test-common                      # pure C++, no GPU
@@ -105,10 +108,17 @@ PKG_OUT := $(PKG_OUT_DIR)/libgsrocmprof.so
 BUILDX_PLATFORMS ?= linux/amd64
 BUILDX_BUILDER ?= graphsignal-builder
 BUILDX_OUT_DIR ?= dist/rocm
+# One artifact per ROCm major, built on the oldest release of that major so
+# it loads on every later one (rocprofiler-sdk keeps its ABI across majors).
+# ROCm 10 is the TheRock-era line (7.14 -> 10.0); its dev images are tagged
+# `-full` instead of `-complete`.
 ROCM7_VERSION ?= 7.2.3
+ROCM7_IMAGE_TAG ?= $(ROCM7_VERSION)-complete
+ROCM10_VERSION ?= 10.0.0
+ROCM10_IMAGE_TAG ?= $(ROCM10_VERSION)-full
 
 .PHONY: all rocm rocm-install test test-probe test-common test-rocm-activity clean distclean info \
-	buildx-setup rocm-buildx rocm-buildx-rocm7 rocm-buildx-install
+	buildx-setup rocm-buildx rocm-buildx-rocm7 rocm-buildx-rocm10 rocm-buildx-install
 
 all: rocm
 
@@ -127,6 +137,7 @@ info:
 	@echo "BUILDX_BUILDER=$(BUILDX_BUILDER)"
 	@echo "BUILDX_OUT_DIR=$(BUILDX_OUT_DIR)"
 	@echo "ROCM7_VERSION=$(ROCM7_VERSION)"
+	@echo "ROCM10_VERSION=$(ROCM10_VERSION)"
 	@echo "CXX=$(CXX)"
 	@echo "CXXFLAGS=$(CXXFLAGS)"
 	@echo "CPPFLAGS=$(CPPFLAGS)"
@@ -172,7 +183,7 @@ buildx-setup:
 	@docker buildx inspect --bootstrap >/dev/null
 	@echo "buildx is ready"
 
-rocm-buildx: rocm-buildx-rocm7
+rocm-buildx: rocm-buildx-rocm7 rocm-buildx-rocm10
 
 rocm-buildx-rocm7:
 	@mkdir -p "$(BUILDX_OUT_DIR)"
@@ -180,7 +191,20 @@ rocm-buildx-rocm7:
 		--builder "$(BUILDX_BUILDER)" \
 		--platform "$(BUILDX_PLATFORMS)" \
 		--build-arg ROCM_VERSION="$(ROCM7_VERSION)" \
+		--build-arg ROCM_IMAGE_TAG="$(ROCM7_IMAGE_TAG)" \
 		--build-arg ROCM_MAJOR=7 \
+		-f Dockerfile.rocm \
+		--output type=local,dest="$(BUILDX_OUT_DIR)" \
+		.
+
+rocm-buildx-rocm10:
+	@mkdir -p "$(BUILDX_OUT_DIR)"
+	docker buildx build \
+		--builder "$(BUILDX_BUILDER)" \
+		--platform "$(BUILDX_PLATFORMS)" \
+		--build-arg ROCM_VERSION="$(ROCM10_VERSION)" \
+		--build-arg ROCM_IMAGE_TAG="$(ROCM10_IMAGE_TAG)" \
+		--build-arg ROCM_MAJOR=10 \
 		-f Dockerfile.rocm \
 		--output type=local,dest="$(BUILDX_OUT_DIR)" \
 		.
@@ -253,11 +277,13 @@ test-rocm-activity:
 		$(MAKE) -f Makefile.rocm $(OUT) ROCM_MAJOR=$(ROCM_MAJOR) ROCM_PATH=$(ROCM_PATH); \
 		echo "Building test with hipcc: $(TEST_ROCM_ACT_OUT)"; \
 		"$$hipcc_bin" $(TEST_ROCM_ACT_FLAGS) -o "$(TEST_ROCM_ACT_OUT)" $(TEST_ROCM_ACT_SRC); \
-		echo "Running test: $(TEST_ROCM_ACT_OUT) (tool injected via ROCP_TOOL_LIBRARIES)"; \
-		ROCP_TOOL_LIBRARIES="$$(cd "$$(dirname "$(OUT)")" && pwd)/$$(basename "$(OUT)")" \
-		LD_LIBRARY_PATH="$(ROCM_LIB_DIR):$${LD_LIBRARY_PATH:-}" \
-		GRAPHSIGNAL_DEBUG=1 \
-			./$(TEST_ROCM_ACT_OUT); \
+		for mode in all none; do \
+			echo "Running test: $(TEST_ROCM_ACT_OUT) (tool injected via ROCP_TOOL_LIBRARIES, GRAPHSIGNAL_ROCM_KERNEL_TRACE=$$mode)"; \
+			ROCP_TOOL_LIBRARIES="$$(cd "$$(dirname "$(OUT)")" && pwd)/$$(basename "$(OUT)")" \
+			LD_LIBRARY_PATH="$(ROCM_LIB_DIR):$${LD_LIBRARY_PATH:-}" \
+			GRAPHSIGNAL_DEBUG=1 GRAPHSIGNAL_ROCM_KERNEL_TRACE=$$mode \
+				./$(TEST_ROCM_ACT_OUT); \
+		done; \
 	'
 
 # ---------------- Clean ----------------
