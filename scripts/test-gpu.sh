@@ -7,7 +7,10 @@
 #
 # Options:
 #   --host HOST      remote host (default: $GRAPHSIGNAL_GPU_HOST or dev-sglang-spark-01)
-#   --setup          run scripts/init-novenv.sh on the remote first (full dep install)
+#   --setup          recreate the remote venv from scratch
+#
+# The Python suite runs in a venv on the remote ($GRAPHSIGNAL_GPU_VENV, default
+# /tmp/gsrepo-venv; see scripts/test-gpu-python.sh), never the system Python.
 #   --python-only    run only the Python suite
 #   --native-only    run only the native tests
 #
@@ -20,6 +23,7 @@ set -euo pipefail
 
 HOST="${GRAPHSIGNAL_GPU_HOST:-dev-sglang-spark-01}"
 REMOTE_DIR="${GRAPHSIGNAL_GPU_DIR:-/tmp/gsrepo}"
+REMOTE_VENV="${GRAPHSIGNAL_GPU_VENV:-/tmp/gsrepo-venv}"
 SETUP=0
 RUN_PYTHON=1
 RUN_NATIVE=1
@@ -43,16 +47,12 @@ rsync -a --delete \
   --exclude __pycache__ --exclude .pytest_cache \
   ./ "$HOST:$REMOTE_DIR/"
 
-if [[ $SETUP -eq 1 ]]; then
-  echo "==> remote setup (init-novenv.sh)"
-  ssh "$HOST" "cd $REMOTE_DIR && bash scripts/init-novenv.sh"
-fi
-
 if [[ $RUN_PYTHON -eq 1 ]]; then
   echo "==> python suite"
-  ssh "$HOST" "cd $REMOTE_DIR \
-    && PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install -q -e . --no-deps \
-    && python3 -m scripts.test_local ${PYTEST_ARGS[*]:-}"
+  RECREATE=""
+  [[ $SETUP -eq 1 ]] && RECREATE="--recreate"
+  ssh "$HOST" "cd $REMOTE_DIR && GRAPHSIGNAL_GPU_VENV=$REMOTE_VENV \
+    bash scripts/test-gpu-python.sh $RECREATE ${PYTEST_ARGS[*]:-}"
 fi
 
 if [[ $RUN_NATIVE -eq 1 ]]; then

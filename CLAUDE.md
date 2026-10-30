@@ -35,12 +35,12 @@ make -f Makefile.rocm test-rocm-activity ROCM_MAJOR=7
 # suite and the native tests (CUPTI headers auto-downloaded from the matching
 # nvidia-cuda-cupti wheel when the toolkit doesn't ship them)
 scripts/test-gpu.sh                 # host: $GRAPHSIGNAL_GPU_HOST or dev-sglang-spark-01
-scripts/test-gpu.sh --setup         # first run: also installs deps via scripts/init-novenv.sh
+scripts/test-gpu.sh --setup         # recreate the remote venv from scratch
 scripts/test-gpu.sh --python-only test/recorders/test_shm_recorder.py
 scripts/test-gpu.sh --native-only
 ```
 
-GPU box: `ssh dev-sglang-spark-01` (DGX Spark, arm64, CUDA 13.x). `scripts/test-gpu-native.sh` is the remote half (runs on the box; also usable directly on any GPU machine).
+GPU box: `ssh dev-sglang-spark-01` (DGX Spark, arm64, CUDA 13.x). `scripts/test-gpu-python.sh` and `scripts/test-gpu-native.sh` are the remote halves (run on the box; also usable directly on any GPU machine). The Python half installs into a venv with system site-packages (`$GRAPHSIGNAL_GPU_VENV`, default `/tmp/gsrepo-venv`), pinned to `poetry.lock`, so the box's CUDA torch stays visible and the system Python the engines run from is never touched.
 
 ```bash
 # Engine-level scenarios on a GPU machine (inside the engine's environment):
