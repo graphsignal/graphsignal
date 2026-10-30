@@ -46,7 +46,6 @@ cu13 = ["nvidia-cuda-cupti"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"
-pytest-forked = "*"
 
 [tool.poetry.scripts]
 graphsignal-run = "graphsignal.commands.graphsignal_run:main"

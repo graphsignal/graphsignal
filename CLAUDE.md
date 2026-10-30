@@ -14,10 +14,12 @@ poetry run python -m scripts.test_local
 poetry run python -m scripts.test_local test/recorders/test_process_recorder.py
 poetry run python -m scripts.test_local test/signals/test_metrics.py::MetricStoreTest::test_add_gauge
 
-# Tests use --forked (each test in a fresh process) and -vv with DEBUG logging by default
+# Tests run in one pytest process with -vv and DEBUG logging by default
 ```
 
-**CUDA tests:** Any test that touches real CUDA must be marked with `@pytest.mark.cuda`. The default run invokes `pytest-forked`, and a `fork()` after CUDA init corrupts the child's CUDA context; `test/conftest.py` intercepts `cuda`-marked tests and reruns them unforked in a fresh subprocess.
+**Test isolation:** tests share the pytest process, so a test that changes process-global state must restore it — env vars (`patch.dict(os.environ)` or `clear_graphsignal_env()` in setUp/tearDown), the watcher singleton (`shutdown_test_watcher()`), `/dev/shm` dirs.
+
+**CUDA tests:** Any test that touches real CUDA must be marked with `@pytest.mark.cuda`. CUDA state and the CUPTI injection library can't be torn down within a process, so `test/conftest.py` intercepts `cuda`-marked tests and runs each in a fresh `python -m pytest` subprocess (with `CUDA_INJECTION64_PATH` stripped from its env).
 
 ```bash
 # Native pure-C++ tests (no GPU; run on macOS or Linux)

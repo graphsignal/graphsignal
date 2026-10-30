@@ -406,13 +406,12 @@ class CudaGraphTraceEnvVarTest(unittest.TestCase):
     ENV_VAR = 'GRAPHSIGNAL_CUDA_GRAPH_TRACE'
 
     def setUp(self):
-        self._saved = os.environ.get(self.ENV_VAR)
-
-    def tearDown(self):
-        if self._saved is None:
-            os.environ.pop(self.ENV_VAR, None)
-        else:
-            os.environ[self.ENV_VAR] = self._saved
+        # Restore the whole environment, not just ENV_VAR: on a CUDA machine
+        # setup_env_vars also sets CUDA_INJECTION64_PATH and LD_LIBRARY_PATH,
+        # which must not leak into later tests in this pytest process.
+        env_patch = patch.dict(os.environ)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
 
     def test_sets_env_var(self):
         os.environ.pop(self.ENV_VAR, None)

@@ -29,5 +29,5 @@ docker run -d --name "$NAME" --network host \
   -v "$REPO_DIR:$REPO_DIR" -v "$HF_DIR:$HF_DIR" -e HF_HOME="$HF_DIR" \
   "$IMAGE" sleep infinity
 docker exec "$NAME" bash -c "cat /opt/rocm/.info/version; ls /opt/rocm/lib/librocprofiler-sdk.so.*.*.*; python3 --version; pip list 2>/dev/null | grep -i -E '^(torch|sglang|amdsmi) '"
-docker exec -w "$REPO_DIR" "$NAME" bash -c "pip install -q -e . --no-deps && pip install -q pytest pytest-forked && graphsignal-run --version"
+docker exec -w "$REPO_DIR" "$NAME" bash -c "pip install -q -e . --no-deps && pip install -q pytest && graphsignal-run --version"
 echo "ready: docker exec -w $REPO_DIR $NAME bash scripts/scenarios/sglang_scenarios.sh baseline prof"
