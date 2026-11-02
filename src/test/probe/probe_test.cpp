@@ -70,6 +70,8 @@ static void test_bin_math() {
       ASSERT(v < graphsignal_probe_bin_lower(idx + 1),
              "value must be below the next bin's lower bound");
     }
+    ASSERT(v <= graphsignal_probe_bin_upper(idx),
+           "value must not exceed its bin's upper bound");
   }
 
   // Strict monotonicity of bin_lower over the reachable range; bins 252+ are
@@ -89,6 +91,21 @@ static void test_bin_math() {
     ASSERT_EQ(graphsignal_probe_bin_index(graphsignal_probe_bin_lower(i)),
               i, "bin_index(bin_lower(idx)) must round-trip");
   }
+
+  // The upper bound is the bin's last value: it maps back to the bin, and the
+  // next value starts the next bin. Bin 251 ends at UINT64_MAX.
+  for (uint32_t i = 0; i <= 251; i++) {
+    ASSERT_EQ(graphsignal_probe_bin_index(graphsignal_probe_bin_upper(i)),
+              i, "bin_index(bin_upper(idx)) must round-trip");
+    if (i < 251u) {
+      ASSERT_EQ(graphsignal_probe_bin_upper(i) + 1, graphsignal_probe_bin_lower(i + 1),
+                "bin_upper(idx) + 1 must be the next bin's lower bound");
+    }
+  }
+  ASSERT_EQ(graphsignal_probe_bin_upper(251), UINT64_MAX,
+            "the top reachable bin ends at UINT64_MAX");
+  ASSERT_EQ(graphsignal_probe_bin_upper(3), 3ull, "exact bins end where they start");
+  ASSERT_EQ(graphsignal_probe_bin_upper(22), 111ull, "bin 22 holds 96..111");
 }
 
 static void test_histogram_stats() {

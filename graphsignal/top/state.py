@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 
 from graphsignal.signals.routes import quantiles_from_bins
 from graphsignal.top.engines import ENGINES, detect_engine
-from graphsignal.top.kernels import KernelName, graph_name, readable_name
+from graphsignal.signals.kernels import KernelName, graph_name, readable_name
 
 NS_PER_S = 1_000_000_000
 

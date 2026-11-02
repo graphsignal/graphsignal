@@ -33,7 +33,8 @@ class Metric:
         # histogram: {'ts'[, 'bins', 'counts'][, 'count', 'sum', 'min', 'max']}
         #            (cumulative; bins and the exact aggregates are supplied
         #            independently, so a distribution with no buckets and a
-        #            bucketed one with no totals are both whole datapoints)
+        #            bucketed one with no totals are both whole datapoints;
+        #            a bin value is the bin's inclusive upper bound)
         # profile:   {'ts', 'frames', 'samples'}          (cumulative value and
         #            sample count per frame name, at most MAX_PROFILE_FRAMES)
         self.datapoint = None
@@ -85,6 +86,9 @@ class MetricStore:
 
         `min`/`max` are the extremes over the instrument's whole life, and only
         travel when the source keeps them.
+
+        A bin value is the bin's inclusive upper bound — a Prometheus `le`, and
+        what the native writers serialize for their log-linear bins.
         """
         if name is None:
             raise ValueError('Metric name cannot be None')

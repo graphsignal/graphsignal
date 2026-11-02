@@ -820,6 +820,12 @@ int main(int argc, char** argv) {
     const auto blocks = find_metric_blocks(json1, "testapp_host_duration");
     ASSERT(!blocks.empty(), "testapp_host_duration missing");
     assert_histogram_sane(blocks[0], 10, "testapp_host_duration");
+    // 1,000,000..1,004,000 land in bin 917504..1048575 and 2,000,000..2,004,000
+    // in bin 1835008..2097151; each bin is serialized as its inclusive upper
+    // bound.
+    ASSERT(blocks[0].find("\"bins\":[1048575,2097151],\"counts\":[5,5]") !=
+               std::string::npos,
+           "host probe bins must be the bins' upper bounds");
   }
   {
     const auto blocks = find_metric_blocks(json1, "testapp_host_profile");

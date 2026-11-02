@@ -544,11 +544,12 @@ int main() {
 
   // Host histogram probe: discovered from the probe.h registry, serialized
   // with its tags, bins/counts and the exact aggregates. 100/200/300 land in
-  // the log-linear bins with lower bounds 96/192/256, one observation each.
+  // the log-linear bins 96..111, 192..223 and 256..319, one observation each,
+  // serialized as their inclusive upper bounds.
   const std::string probe_block = find_metric(
       blocks_v, "gstest_batch_duration", "\"stage\":\"decode\"");
   assert_histogram_sane(probe_block, 3, "host probe gstest_batch_duration missing");
-  ASSERT(probe_block.find("\"bins\":[96,192,256],\"counts\":[1,1,1]") !=
+  ASSERT(probe_block.find("\"bins\":[111,223,319],\"counts\":[1,1,1]") !=
              std::string::npos,
          "host probe bins/counts must match the recorded values exactly");
   ASSERT(block_u64(probe_block, "count") == 3, "host probe count must be 3");

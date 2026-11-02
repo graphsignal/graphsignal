@@ -4,6 +4,9 @@
 (with per-type statistics), recent errors, resources, and the watcher's global
 tags as a top-level `context` object. Values follow the convention:
 null = not measured, 0 = measured zero.
+
+`GET /metrics` serves the same metrics in the Prometheus text format, for
+scrapers (see prometheus.py).
 """
 
 import http.server
@@ -14,6 +17,7 @@ import threading
 import time
 
 from graphsignal.signals import metrics as metrics_module
+from graphsignal.signals import prometheus
 from graphsignal.version import __version__
 
 logger = logging.getLogger('graphsignal')
@@ -60,7 +64,7 @@ def _histogram_stats(dp):
     """count/sum/min/max exactly as measured; mean, p50, p95 derived.
 
     The exact totals win over the bins for the mean: a bin-weighted mean takes
-    every observation at its bin's lower bound, and the writer's own sum did
+    every observation at its bin's upper bound, and the writer's own sum did
     not. Quantiles have no such alternative — they only exist where there are
     bins, and are null for a source that reports totals alone.
     """
@@ -176,6 +180,9 @@ class _SignalsRequestHandler(http.server.BaseHTTPRequestHandler):
         try:
             if self.path == '/signals':
                 self._respond_json(200, build_payload())
+            elif self.path == '/metrics':
+                self._respond_text(200, prometheus.render_metrics(),
+                                   prometheus.CONTENT_TYPE)
             elif self.path == '/health':
                 self._respond_json(200, {'status': 'ok'})
             else:
@@ -195,11 +202,22 @@ class _SignalsRequestHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _respond_text(self, status, text, content_type):
+        body = text.encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format, *args):
         logger.debug('signals endpoint: ' + format, *args)
 
 
 class SignalsEndpoint:
+    """The watcher's HTTP listener: /signals (JSON), /metrics (Prometheus
+    text) and /health."""
+
     # A busy port at startup is usually the previous run's watcher finishing
     # its last tick, so the bind is retried for a while before giving up.
     BIND_RETRY_INTERVAL_S = 2.0

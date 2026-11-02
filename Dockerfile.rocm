@@ -23,9 +23,14 @@ ARG TARGETARCH
 
 WORKDIR /src
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends g++ make \
-    && rm -rf /var/lib/apt/lists/*
+# The dev images ship g++ and make; install them only where missing. apt in
+# the 7.2.3 image rejects its own Ubuntu keyrings ("unsupported filetype"), so
+# an unconditional `apt-get update` fails the build there.
+RUN if ! command -v g++ >/dev/null || ! command -v make >/dev/null; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends g++ make \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Only the native sources are needed in the build context.
 COPY Makefile.cupti Makefile.rocm ./

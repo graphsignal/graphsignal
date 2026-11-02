@@ -19,6 +19,8 @@ import time
 import unittest
 import urllib.request
 
+from prometheus_client.parser import text_string_to_metric_families
+
 from test.test_utils import free_port
 
 
@@ -90,6 +92,29 @@ class GraphsignalRunE2ETest(unittest.TestCase):
             self.assertIsInstance(report['metrics'], list)
             self.assertIsInstance(report['errors'], list)
             self.assertIsInstance(report['resources'], list)
+
+            # The same listener serves the metrics to Prometheus scrapers. The
+            # workload's memory gauge needs the pid monitor to see it first
+            # (its CPU gauge stays out while it sleeps at 0%).
+            workload_pid = None
+            deadline = time.time() + 30
+            while time.time() < deadline and workload_pid is None:
+                with urllib.request.urlopen(
+                        f'http://127.0.0.1:{listen_port}/metrics',
+                        timeout=2) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertTrue(resp.headers['Content-Type'].startswith(
+                        'text/plain; version=0.0.4'))
+                    families = {f.name: f for f in text_string_to_metric_families(
+                        resp.read().decode('utf-8'))}
+                self.assertIn('graphsignal_profiler_info', families)
+                memory = families.get('process_memory_usage_bytes')
+                if memory is not None and memory.samples:
+                    workload_pid = memory.samples[0].labels.get('process_pid')
+                else:
+                    time.sleep(0.5)
+            self.assertTrue(workload_pid,
+                            msg='process_memory_usage_bytes{process_pid} never appeared')
         finally:
             proc.terminate()
             try:

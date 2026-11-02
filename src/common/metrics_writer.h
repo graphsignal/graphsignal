@@ -780,6 +780,9 @@ class MetricsWriter {
   }
 
   // Omitted entirely when every bin is empty — see serialize_hist_aggregates.
+  // Each bin is serialized as its inclusive upper bound, the same meaning a
+  // Prometheus `le` bucket has, so every histogram the importer sees reads
+  // alike whatever produced it.
   static void serialize_bins(std::string& j, const uint64_t* bins) {
     std::string bins_json;
     std::string counts_json;
@@ -789,7 +792,7 @@ class MetricsWriter {
         bins_json += ',';
         counts_json += ',';
       }
-      append_u64(bins_json, graphsignal_probe_bin_lower(b));
+      append_u64(bins_json, graphsignal_probe_bin_upper(b));
       append_u64(counts_json, bins[b]);
     }
     if (bins_json.empty()) return;

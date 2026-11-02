@@ -54,6 +54,9 @@ CPPFLAGS ?= -D__HIP_PLATFORM_AMD__ -Iinclude -Isrc/common -I$(ROCM_INCLUDE_DIR)$
 
 # ---------------- Build outputs ----------------
 SRC := src/rocm/rocm_activity.cpp
+# Everything the sources include: a header change must rebuild the library and
+# the tests, or a test runs against a stale build.
+HEADERS := $(wildcard include/graphsignal/*.h src/common/*.h src/rocm/*.h)
 BUILD_DIR := build
 OUT := $(BUILD_DIR)/libgsrocmprof.so$(if $(ROCM_MAJOR),.$(ROCM_MAJOR),)
 
@@ -150,7 +153,7 @@ $(BUILD_DIR):
 # ---------------- Build / install ----------------
 rocm: $(OUT)
 
-$(OUT): $(SRC) | $(BUILD_DIR)
+$(OUT): $(SRC) $(HEADERS) | $(BUILD_DIR)
 	@if [[ "$(UNAME_S)" == "Darwin" ]]; then \
 		echo "ROCm build is not supported on macOS (ROCm is Linux only)."; \
 		exit 1; \
@@ -238,7 +241,7 @@ test-probe: $(TEST_PROBE_OUT)
 	@echo "Running test: $(TEST_PROBE_OUT)"
 	@./$(TEST_PROBE_OUT)
 
-$(TEST_PROBE_OUT): $(TEST_PROBE_SRC) | $(BUILD_DIR)
+$(TEST_PROBE_OUT): $(TEST_PROBE_SRC) $(HEADERS) | $(BUILD_DIR)
 	@echo "Building test: $@"
 	$(CXX) $(CXXFLAGS) -Iinclude $(TEST_LDFLAGS) -o "$@" $(TEST_PROBE_SRC) $(TEST_LDLIBS)
 
@@ -246,7 +249,7 @@ test-common: $(TEST_COMMON_OUT)
 	@echo "Running test: $(TEST_COMMON_OUT)"
 	@./$(TEST_COMMON_OUT)
 
-$(TEST_COMMON_OUT): $(TEST_COMMON_SRC) | $(BUILD_DIR)
+$(TEST_COMMON_OUT): $(TEST_COMMON_SRC) $(HEADERS) | $(BUILD_DIR)
 	@echo "Building test: $@"
 	$(CXX) $(CXXFLAGS) -Iinclude -Isrc/common $(TEST_LDFLAGS) -o "$@" $(TEST_COMMON_SRC) $(TEST_LDLIBS)
 

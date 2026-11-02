@@ -324,9 +324,10 @@ static void test_instruments() {
   std::string hist = metric_object(j, "gpu_kernel_time");
   ASSERT(!hist.empty(), "histogram metric must be serialized");
   ASSERT(contains(hist, "\"type\":\"histogram\""), "histogram type");
-  // 3 -> bin 3 (lower 3); 100 -> bin 22 (lower 96); 5000 -> bin 44 (lower
-  // 4096). Sparse ascending arrays of equal length, counts summing to 3.
-  ASSERT(contains(hist, "\"bins\":[3,96,4096],\"counts\":[1,1,1]"),
+  // 3 -> bin 3 (3..3); 100 -> bin 22 (96..111); 5000 -> bin 44 (4096..5119),
+  // each serialized as its inclusive upper bound. Sparse ascending arrays of
+  // equal length, counts summing to 3.
+  ASSERT(contains(hist, "\"bins\":[3,111,5119],\"counts\":[1,1,1]"),
          "sparse bins/counts arrays");
   // Exact aggregates ride next to the bins: 3 values, sum 5103, min 3, max 5000.
   ASSERT(contains(hist, "\"count\":3,\"sum\":5103,\"min\":3,\"max\":5000"),
@@ -676,8 +677,8 @@ static void test_probe_merge() {
   std::string hobj = metric_object(j, "user_h_probe");
   ASSERT(!hobj.empty(), "host probe must be merged into the writer JSON");
   ASSERT(contains(hobj, "\"type\":\"histogram\""), "host probe type");
-  // 42 -> bin 17 (lower 40); bins/counts only, no aggregate fields.
-  ASSERT(contains(hobj, "\"bins\":[40],\"counts\":[1]"),
+  // 42 -> bin 17 (40..47), serialized as its upper bound 47.
+  ASSERT(contains(hobj, "\"bins\":[47],\"counts\":[1]"),
          "host probe bins/counts");
   ASSERT(contains(hobj, "\"count\":1,\"sum\":42,\"min\":42,\"max\":42"),
          "host probe exact aggregates");
@@ -722,7 +723,7 @@ static void test_probe_merge() {
   assert_well_formed(j);
   std::string dobj = metric_object(j, "user_d_probe");
   ASSERT(!dobj.empty(), "device probe must appear once a reader is set");
-  // 3 -> bin 3 (lower 3); 7 -> bin 7 (lower 7); bins/counts only.
+  // 3 -> bin 3 (3..3); 7 -> bin 7 (7..7): exact bins, upper bound = value.
   ASSERT(contains(dobj, "\"bins\":[3,7],\"counts\":[1,1]"),
          "device probe bins/counts");
   ASSERT(contains(dobj, "\"count\":2,\"sum\":10,\"min\":3,\"max\":7"),

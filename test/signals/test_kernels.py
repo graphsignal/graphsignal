@@ -1,6 +1,6 @@
 import unittest
 
-from graphsignal.top.kernels import demangle_short, readable_name, graph_name
+from graphsignal.signals.kernels import demangle_short, readable_name, graph_name
 
 
 def mangle(*parts, template=True):

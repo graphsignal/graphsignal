@@ -10,7 +10,7 @@ Graphsignal is a GPU profiler for AI agents to autonomously optimize inference p
 * Process and host metrics: CPU, memory, command lines, runtimes.
 * Inference engine metrics imported from Prometheus endpoints (vLLM, SGLang, TensorRT-LLM).
 * Error capture from engine console output, including crashes and tracebacks.
-* Local `/signals` HTTP endpoint serving metric statistics, recent errors, and resources as JSON.
+* Local `/signals` HTTP endpoint serving metric statistics, recent errors, and resources as JSON, and `/metrics` serving the metrics in Prometheus format.
 
 The profiler runs entirely locally: it listens on `127.0.0.1` (unless you bind it elsewhere with `--listen-host`) and sends no profiling data anywhere else unless you opt into the [production feedback loop](#production-feedback-loop).
 
@@ -66,8 +66,8 @@ Options (before the command):
 | --- | --- |
 | `--version` | Print the profiler version and exit. |
 | `--metrics-port PORT` | Port to scrape the engine's Prometheus metrics on (default: derived from the engine's `--port`). |
-| `--listen-host HOST` | Host to bind the `/signals` endpoint to (default: `127.0.0.1`). Set e.g. `0.0.0.0` to expose it for remote access — anything on that network can then read it. |
-| `--listen-port PORT` | Port for the `/signals` endpoint (default: `18259`). |
+| `--listen-host HOST` | Host to bind the `/signals` and `/metrics` endpoint to (default: `127.0.0.1`). Set e.g. `0.0.0.0` to expose it for remote access — anything on that network can then read it. |
+| `--listen-port PORT` | Port for the `/signals` and `/metrics` endpoint (default: `18259`). |
 | `--cuda-graph-trace {graph\|node}` | Granularity for CUDA graph launches (default: `graph`). `graph` times each replay as a whole into `cuda_graphs_nanoseconds`; `node` times the kernels inside the graph individually into `cuda_kernels_nanoseconds`. Also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`; the flag wins. |
 | `--rocm-kernel-trace {none\|all}` | Per-kernel tracing on ROCm (default: `none`). `all` times every kernel dispatch into `rocm_kernels_nanoseconds`. rocprofiler-sdk charges tens of microseconds per dispatch for it, so this is an investigation mode, not for production (see [Overhead](#overhead)). Also settable via `GRAPHSIGNAL_ROCM_KERNEL_TRACE`; the flag wins. |
 
@@ -94,6 +94,26 @@ The response contains:
 The endpoint is what closes the loop: an AI agent launches the workload under `graphsignal-run`, polls `/signals` under load, reads which kernels, transfers, or synchronization dominate, changes flags or code, and measures again. [SKILL.md](SKILL.md) teaches an agent the payload semantics and how to interpret it; see the [AI Optimization guide](https://graphsignal.com/docs/guides/ai-optimization/) for the full workflow.
 
 Engines that capture their decode step into a CUDA graph — vLLM, SGLang, TensorRT-LLM, llama.cpp — replay one graph per token, so by default their decode time arrives as whole replays in `cuda_graphs_nanoseconds` and `cuda_kernels_nanoseconds` holds only the eager (prefill) kernels. When the loop needs a per-kernel ranking, relaunch with `--cuda-graph-trace node`: the same kernels then appear in `cuda_kernels_nanoseconds` by symbol, `cuda_graphs_nanoseconds` goes empty, and the `cuda_graph_trace_mode` gauge records which granularity produced the payload. It needs no elevated privileges — it is an investigation mode, not a deployment default (see Overhead).
+
+## Prometheus metrics
+
+The same listener serves the metrics in the Prometheus text format, so a Prometheus server can scrape them into an existing Grafana stack:
+
+```bash
+curl -s http://127.0.0.1:18259/metrics
+```
+
+* Gauges stay gauges; counters get a `_total` suffix.
+* Histograms become Prometheus histograms (`_bucket{le}`, `_count`, `_sum`), plus `_min`/`_max` gauges where the source keeps the extremes.
+* Profiles become two counters with one series per frame: `<name>_total` (cumulative value) and `<name>_samples_total` (sample count). Kernel frames carry `kernel`, `symbol`, `category`, and `library` labels.
+
+Metric tags and the run's context tags become labels (`process.pid` → `process_pid`); the version and instance id are on the `graphsignal_profiler_info` gauge. A kernel leaderboard in Grafana:
+
+```text
+topk(20, rate(cuda_kernels_nanoseconds_total[1m]))
+```
+
+See the [Prometheus Metrics guide](https://graphsignal.com/docs/guides/prometheus-metrics/) for the scrape config, label rules, and caveats.
 
 ## Live view
 
@@ -218,7 +238,7 @@ What each mode costs, measured, and the method behind the numbers: [Profiler Ove
 
 ## Security and privacy
 
-The profiler runs as a sidecar process and does not require root or elevated privileges. Its `/signals` endpoint binds to `127.0.0.1` by default — when no listen host is specified, it is not reachable from outside the machine. Binding another host with `--listen-host` is an explicit opt-in that exposes the endpoint for remote access; it is read-only but unauthenticated, so restrict access at the network level.
+The profiler runs as a sidecar process and does not require root or elevated privileges. Its `/signals` and `/metrics` endpoint binds to `127.0.0.1` by default — when no listen host is specified, it is not reachable from outside the machine. Binding another host with `--listen-host` is an explicit opt-in that exposes the endpoint for remote access; it is read-only but unauthenticated, so restrict access at the network level.
 
 Signals are uploaded only when `GRAPHSIGNAL_API_KEY` is set, and only to the server it reports to. Without the key, no profiling data ever leaves the machine. Remote commands are not possible in any configuration.
 

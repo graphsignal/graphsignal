@@ -54,6 +54,9 @@ NVCCFLAGS ?= -O2 -std=c++17 -arch=native -I$(CUPTI_INCLUDE_DIR) -I$(CUDA_HOME)/i
 
 # ---------------- Build outputs ----------------
 SRC := src/cupti/cupti_activity.cpp
+# Everything the sources include: a header change must rebuild the library and
+# every test object, or a test runs against a stale build.
+HEADERS := $(wildcard include/graphsignal/*.h src/common/*.h src/cupti/*.h)
 BUILD_DIR := build
 OUT := $(BUILD_DIR)/libgscuptiprof.so$(if $(CUDA_MAJOR),.$(CUDA_MAJOR),)
 
@@ -150,7 +153,7 @@ $(BUILD_DIR):
 # ---------------- Build / install ----------------
 cupti: $(OUT)
 
-$(OUT): $(SRC) | $(BUILD_DIR)
+$(OUT): $(SRC) $(HEADERS) | $(BUILD_DIR)
 	@if [[ "$(UNAME_S)" == "Darwin" ]]; then \
 		echo "CUPTI build is not supported on macOS (CUPTI is Linux/Windows only)."; \
 		exit 1; \
@@ -236,7 +239,7 @@ test-probe: $(TEST_PROBE_OUT)
 	@echo "Running test: $(TEST_PROBE_OUT)"
 	@./$(TEST_PROBE_OUT)
 
-$(TEST_PROBE_OUT): $(TEST_PROBE_SRC) | $(BUILD_DIR)
+$(TEST_PROBE_OUT): $(TEST_PROBE_SRC) $(HEADERS) | $(BUILD_DIR)
 	@echo "Building test: $@"
 	$(CXX) -std=c++17 -Iinclude -pthread -o "$@" $(TEST_PROBE_SRC) -ldl
 
@@ -253,14 +256,14 @@ $(TEST_DISCOVERY_LIB): $(TEST_DISCOVERY_LIB_SRC) src/common/metrics_writer.h inc
 	$(CXX) -std=c++17 -fPIC -shared -Iinclude -Isrc/common -pthread -o "$@" $(TEST_DISCOVERY_LIB_SRC) -ldl
 
 # Deliberately no -rdynamic: the executable must not export its registry.
-$(TEST_DISCOVERY_OUT): $(TEST_DISCOVERY_SRC) include/graphsignal/probe.h | $(BUILD_DIR)
+$(TEST_DISCOVERY_OUT): $(TEST_DISCOVERY_SRC) $(HEADERS) | $(BUILD_DIR)
 	$(CXX) -std=c++17 -Iinclude -pthread -o "$@" $(TEST_DISCOVERY_SRC) -ldl
 
 test-common: $(TEST_COMMON_OUT)
 	@echo "Running test: $(TEST_COMMON_OUT)"
 	@./$(TEST_COMMON_OUT)
 
-$(TEST_COMMON_OUT): $(TEST_COMMON_SRC) | $(BUILD_DIR)
+$(TEST_COMMON_OUT): $(TEST_COMMON_SRC) $(HEADERS) | $(BUILD_DIR)
 	@echo "Building test: $@"
 	$(CXX) -std=c++17 -Iinclude -Isrc/common -pthread -o "$@" $(TEST_COMMON_SRC) -ldl
 
@@ -289,11 +292,11 @@ $(TEST_CUPTI_OUT): $(TEST_CUPTI_TEST_OBJ) $(TEST_CUPTI_OTHER_OBJ) | $(BUILD_DIR)
 	@echo "Linking test: $@"
 	$(NVCC) $(TEST_CUPTI_LDFLAGS) -o "$@" $(TEST_CUPTI_TEST_OBJ) $(TEST_CUPTI_OTHER_OBJ) $(TEST_CUPTI_LDLIBS)
 
-$(TEST_CUPTI_TEST_OBJ): $(TEST_CUPTI_TEST_SRC) | $(BUILD_DIR)
+$(TEST_CUPTI_TEST_OBJ): $(TEST_CUPTI_TEST_SRC) $(HEADERS) | $(BUILD_DIR)
 	@echo "Compiling test file with nvcc: $@"
 	$(NVCC) $(NVCCFLAGS) -x cu -c -o "$@" $(TEST_CUPTI_TEST_SRC)
 
-$(BUILD_DIR)/cupti_activity.o: src/cupti/cupti_activity.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/cupti_activity.o: src/cupti/cupti_activity.cpp $(HEADERS) | $(BUILD_DIR)
 	@echo "Compiling cupti_activity.cpp with g++: $@"
 	@if [[ ! -f "$(CUPTI_INCLUDE_DIR)/cupti.h" ]]; then \
 		echo "Error: cupti.h not found under $(CUPTI_INCLUDE_DIR)"; \

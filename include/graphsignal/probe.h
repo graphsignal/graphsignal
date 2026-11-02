@@ -183,6 +183,15 @@ static inline uint64_t graphsignal_probe_bin_lower(uint32_t idx) {
     return (uint64_t)(4u + (idx & 3u)) << (idx / 4u - 1u);
 }
 
+/* Inclusive upper bound of a bin: the largest value bin_index maps to it.
+   Bins hold integers in [lower(i), lower(i+1)), so this is lower(i+1) - 1;
+   the top reachable bin (251) ends at UINT64_MAX. This is the bound the
+   writers serialize, so a reader can use it as a Prometheus `le`. */
+static inline uint64_t graphsignal_probe_bin_upper(uint32_t idx) {
+    if (idx >= 251) return UINT64_MAX;
+    return graphsignal_probe_bin_lower(idx + 1u) - 1u;
+}
+
 /* ---- registration (cold path; may allocate, takes the registry lock) ----- */
 
 static inline void graphsignal_probe__lock(graphsignal_probe_registry* reg) {

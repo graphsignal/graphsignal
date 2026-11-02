@@ -35,12 +35,12 @@ Options (must precede the command):
                   Port to scrape the engine's Prometheus /metrics endpoint on.
                   Overrides the port derived from the engine's --port/default.
   --listen-host HOST
-                  Host to bind the watcher's /signals HTTP endpoint to
-                  (default: 127.0.0.1; any other value exposes the endpoint
-                  to that network).
+                  Host to bind the watcher's /signals and /metrics HTTP
+                  endpoint to (default: 127.0.0.1; any other value exposes
+                  the endpoint to that network).
   --listen-port PORT
-                  Port for the watcher's local /signals HTTP endpoint
-                  (default: 18259).
+                  Port for the watcher's local /signals and /metrics HTTP
+                  endpoint (default: 18259).
   --cuda-graph-trace {graph|node}
                   Granularity for CUDA graph launches (default: graph).
                   `graph` records one timing per graph replay in
@@ -73,7 +73,8 @@ def _extract_graphsignal_flags(argv):
     """Pull graphsignal-run's own flags out of argv before the workload command.
 
     `--metrics-port` specifies the Prometheus scrape port.
-    `--listen-host`/`--listen-port` specify the /signals endpoint bind address.
+    `--listen-host`/`--listen-port` specify the /signals and /metrics endpoint
+    bind address.
     `--cuda-graph-trace` selects the CUDA graph tracing granularity.
     `--rocm-kernel-trace` switches per-kernel tracing on ROCm on or off.
     All are consumed here and never forwarded to the workload. Only leading

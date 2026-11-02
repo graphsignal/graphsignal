@@ -7,6 +7,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from prometheus_client.parser import text_string_to_metric_families
 from graphsignal.signals.routes import SignalsEndpoint
 from test.test_utils import configure_test_watcher, free_port
 
@@ -256,6 +257,27 @@ class SignalsEndpointTest(unittest.TestCase):
         self.assertEqual(record['tags'], {'t1': '1'})
         self.assertEqual(record['updated_ns'], 1020)
         self.assertEqual(record['stats'], {'value': 20.0})
+
+    def test_metrics_serves_prometheus_text(self):
+        self.watcher.set_gauge('g1', 20.0, measurement_ts=1020, tags={'t1': '1'})
+
+        with urllib.request.urlopen(
+                f'http://127.0.0.1:{self.port}/metrics', timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.headers['Content-Type'],
+                             'text/plain; version=0.0.4; charset=utf-8')
+            text = resp.read().decode('utf-8')
+        families = {f.name: f for f in text_string_to_metric_families(text)}
+        self.assertIn('graphsignal_profiler_info', families)
+        (sample,) = families['g1'].samples
+        self.assertEqual(sample.labels['t1'], '1')
+        self.assertNotIn('instance_id', sample.labels)
+        self.assertEqual(sample.value, 20.0)
+
+        # /signals is unaffected.
+        status, payload = self._get('/signals')
+        self.assertEqual(status, 200)
+        self.assertEqual([r['name'] for r in payload['metrics']], ['g1'])
 
     def test_second_endpoint_on_same_port_disabled_without_exception(self):
         second = SignalsEndpoint(port=self.port, bind_retry_timeout=0)
