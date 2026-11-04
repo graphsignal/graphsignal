@@ -113,7 +113,7 @@ Metric tags and the run's context tags become labels (`process.pid` → `process
 topk(20, rate(cuda_kernels_nanoseconds_total[1m]))
 ```
 
-See the [Prometheus Metrics guide](https://graphsignal.com/docs/guides/prometheus-metrics/) for the scrape config, label rules, and caveats.
+See the [Prometheus Metrics guide](https://graphsignal.com/docs/reference/prometheus-metrics/) for the scrape config, label rules, and caveats.
 
 ## Live view
 
