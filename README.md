@@ -7,7 +7,7 @@ Graphsignal is a GPU profiler for AI agents to autonomously optimize inference p
 * GPU activity profiles via CUPTI/ROCm injection: cumulative time per kernel, per CUDA graph, and per memcpy/memset/synchronization kind, plus transfer byte counters.
 * GPU probes: a vendorable C++ header to instrument code and kernels — by hand, or by an agent.
 * GPU telemetry via NVML (NVIDIA) and AMD SMI (ROCm): utilization, memory, power, temperature, clocks, throttling, NVLink/PCIe throughput, XID and ECC errors.
-* Process and host metrics: CPU, memory, command lines, runtimes.
+* Process and host metrics: CPU time per thread (which thread is the bottleneck, and whether it waited for a core), context switches, page faults, cgroup CPU throttling, memory, command lines, runtimes.
 * Inference engine metrics imported from Prometheus endpoints (vLLM, SGLang, TensorRT-LLM).
 * Error capture from engine console output, including crashes and tracebacks.
 * Local `/signals` HTTP endpoint serving metric statistics, recent errors, and resources as JSON, and `/metrics` serving the metrics in Prometheus format.
@@ -125,7 +125,7 @@ graphsignal-top
 
 <img src="assets/graphsignal-top.png" alt="graphsignal-top: GPU utilization and memory, engine throughput and latency, GPU time breakdown, and kernels ranked by time for Qwen3-32B on two RTX PRO 6000s under SGLang" width="100%">
 
-Per GPU: utilization over time, memory, power, temperature, clocks, PCIe traffic, XID errors and throttling, all from the NVML (or AMD SMI) telemetry. The engine block comes from the scraped Prometheus metrics: running and waiting requests, KV-cache usage, token throughput over time, and TTFT / TPOT / end-to-end latency quantiles. Rates and the kernel ranking cover the last 5 seconds (`--window`). Kernels are named by a built-in taxonomy; the details view (`⏎`) shows the full mangled symbol, the totals since start, and the per-process split. `g`, `m` and `s` switch the table to CUDA graph replays, memory transfers and host synchronization.
+Per GPU: utilization over time, memory, power, temperature, clocks, PCIe traffic, XID errors and throttling, all from the NVML (or AMD SMI) telemetry. The engine block comes from the scraped Prometheus metrics: running and waiting requests, KV-cache usage, token throughput over time, and TTFT / TPOT / end-to-end latency quantiles. Rates and the kernel ranking cover the last 5 seconds (`--window`). Kernels are named by a built-in taxonomy; the details view (`⏎`) shows the full mangled symbol, the totals since start, and the per-process split. `g`, `m` and `s` switch the table to CUDA graph replays, memory transfers and host synchronization; `t` shows the host side — every process's threads ranked by CPU time as a share of one core, so a scheduler loop pinned at 100% while the GPU idles is one keystroke away.
 
 A workload on another machine is one flag away, provided its profiler was started with `--listen-host`:
 

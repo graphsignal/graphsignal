@@ -53,7 +53,7 @@ def _histogram(name, bins, per_second_counts, t, ts, tags=None):
 
 
 def build_payload(t, engine='vllm', profiles=True, graph_mode='node', devices=1,
-                  errors=True, extra_metrics=None):
+                  errors=True, extra_metrics=None, threads=False):
     ts = START_NS + int(t * NS)
     metrics = []
 
@@ -105,6 +105,17 @@ def build_payload(t, engine='vllm', profiles=True, graph_mode='node', devices=1,
         metrics.append(_profile('cuda_sync_nanoseconds', {
             'stream_synchronize': (int(60e6 * t), int(50 * t)),
         }, ROOT_PID, ts))
+
+    if threads:
+        # The root's scheduler loop near a full core, a driver thread, and a
+        # child whose main thread shares the root's frame name.
+        metrics.append(_profile('process_threads_cpu_nanoseconds', {
+            'python3/main': (int(900e6 * t), int(500 * t)),
+            'cuda-EvtHandlr': (int(30e6 * t), int(200 * t)),
+        }, ROOT_PID, ts))
+        metrics.append(_profile('process_threads_cpu_nanoseconds', {
+            'python3/main': (int(100e6 * t), int(50 * t)),
+        }, CHILD_PID, ts))
 
     if engine == 'vllm':
         tags = {'model_name': 'm', 'process.pid': ROOT_PID}

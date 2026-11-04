@@ -20,10 +20,11 @@ MIN_TABLE_ROWS = 3
 MIN_TABLE_ROWS_FULL = 10   # below this, sections collapse to make room
 LABEL_COL_MAX = 40
 
-TAB_TITLES = {'kernels': 'KERNELS', 'graphs': 'GRAPHS', 'memcpy': 'MEMCPY', 'sync': 'SYNC'}
+TAB_TITLES = {'kernels': 'KERNELS', 'graphs': 'GRAPHS', 'memcpy': 'MEMCPY', 'sync': 'SYNC',
+              'threads': 'THREADS'}
 # Key that selects each tab, and where that letter sits in the tab's name
 # for the '[k]ernels' rendering.
-TAB_KEYS = {'kernels': 'k', 'graphs': 'g', 'memcpy': 'm', 'sync': 's'}
+TAB_KEYS = {'kernels': 'k', 'graphs': 'g', 'memcpy': 'm', 'sync': 's', 'threads': 't'}
 
 
 @dataclass
@@ -358,15 +359,21 @@ def _table(state, ui, width, rows_available):
     lines.append(_clip(title + [(' ' * gap, 'value')] + tabs, width))
 
     bytes_tab = ui.tab == 'memcpy'
-    cols = [('TIME%', 7, 'right'), ('ms/s', 9, 'right'), ('calls/s', 10, 'right'),
-            ('avg µs', 9, 'right'), ('BYTES/s' if bytes_tab else 'CATEGORY', 13, 'left')]
+    threads_tab = ui.tab == 'threads'
+    # The threads tab is host time: share of one CPU core, times the thread
+    # was scheduled per second, and the average on-CPU burst.
+    cols = [('CPU%' if threads_tab else 'TIME%', 7, 'right'), ('ms/s', 9, 'right'),
+            ('sched/s' if threads_tab else 'calls/s', 10, 'right'),
+            ('avg µs', 9, 'right'),
+            ('BYTES/s' if bytes_tab else 'PROCESS' if threads_tab else 'CATEGORY', 13, 'left')]
     fixed = sum(w + 1 for _, w, _ in cols) + 1
     name_width = max(10, width - fixed)
     header = [(' ', 'value')]
     for name, w, align in cols:
         header.append((fmt.pad(name, w, align) + ' ', 'header'))
     name_header = ('KERNEL' if ui.tab == 'kernels' else
-                   'GRAPH' if ui.tab == 'graphs' else 'KIND')
+                   'GRAPH' if ui.tab == 'graphs' else
+                   'THREAD' if threads_tab else 'KIND')
     header.append((fmt.pad(name_header, name_width), 'header'))
     lines.append(_clip(header, width))
 
@@ -457,7 +464,7 @@ def _box(title, body_lines, width, height):
 
 
 HELP_LINES = [
-    [('k g m s', 'key'), ('   kernels / graphs / memcpy / sync tabs (tab cycles)', 'value')],
+    [('k g m s t', 'key'), (' kernels / graphs / memcpy / sync / threads tabs (tab cycles)', 'value')],
     [('↑ ↓', 'key'), ('       select a row; pgup/pgdn page; home/end jump', 'value')],
     [('⏎', 'key'), ('         details of the selected row: full symbol, totals since start', 'value')],
     [('p', 'key'), ('         pause polling', 'value')],
@@ -492,11 +499,14 @@ def _overlay(state, ui, width, height):
         if row.kernel and row.kernel.library:
             body.append([('library   ', 'label'), (row.kernel.library, 'value')])
         raw = row.raw
+        threads_tab = ui.tab == 'threads'
+        raw_label = 'thread    ' if threads_tab else 'symbol    '
         for i in range(0, max(1, len(raw)), wrap):
-            body.append([('symbol    ' if i == 0 else ' ' * 10, 'label'), (raw[i:i + wrap], 'dim')])
+            body.append([(raw_label if i == 0 else ' ' * 10, 'label'), (raw[i:i + wrap], 'dim')])
 
         def stats(scope, r, per_s):
-            text = (f'time {fmt.fmt_duration_ns(r.value_ns)}  calls {fmt.fmt_count(r.samples)}  '
+            count_label = 'sched' if threads_tab else 'calls'
+            text = (f'time {fmt.fmt_duration_ns(r.value_ns)}  {count_label} {fmt.fmt_count(r.samples)}  '
                     f'avg {fmt.fmt_duration_ns(r.avg_ns)}  share {fmt.fmt_percent(r.share_pct, 1)}')
             if r.bytes_per_s is not None:
                 text += f'  bytes {fmt.fmt_bytes(r.bytes_per_s)}' + ('/s' if per_s else '')
@@ -510,7 +520,8 @@ def _overlay(state, ui, width, height):
             body.append([('processes ', 'label'), ('', 'value')])
             for pid, (value, samples) in sorted(row.per_process.items(), key=lambda kv: -kv[1][0]):
                 body.append([(' ' * 10, 'value'),
-                             (f'pid {pid:<8} {fmt.fmt_duration_ns(value):>10}  {fmt.fmt_count(samples):>9} calls', 'value')])
+                             (f'pid {pid:<8} {fmt.fmt_duration_ns(value):>10}  {fmt.fmt_count(samples):>9} '
+                              f'{"sched" if threads_tab else "calls"}', 'value')])
         return _box('details', body, width, height)
     return None
 

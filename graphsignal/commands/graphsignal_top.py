@@ -31,7 +31,7 @@ Options:
   -h, --help        Show this help and exit.
 
 Keys:
-  k g m s     kernels / graphs / memcpy / sync tabs (tab cycles)
+  k g m s t   kernels / graphs / memcpy / sync / threads tabs (tab cycles)
   up/down     select a row; enter shows its details (full symbol,
               totals since start, per-process split)
   p           pause          e  recent errors

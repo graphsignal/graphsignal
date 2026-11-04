@@ -263,6 +263,30 @@ class TableTest(unittest.TestCase):
         self.assertFalse(state.has_tab('memset'))
         self.assertAlmostEqual(state.gpu_time().memset, 0.2)
 
+    def test_thread_rows_are_per_process_and_share_of_a_core(self):
+        state = state_after(range(10, 21), threads=True)
+        self.assertTrue(state.has_tab('threads'))
+        rows = state.table('threads')
+        self.assertEqual([(r.label, r.category) for r in rows],
+                         [('python3/main', f'pid {fx.ROOT_PID}'),
+                          ('python3/main', f'pid {fx.CHILD_PID}'),
+                          ('cuda-EvtHandlr', f'pid {fx.ROOT_PID}')])
+        root = rows[0]
+        # 900 ms of CPU per second: 90% of one core, whatever the GPU count.
+        self.assertAlmostEqual(root.share_pct, 90.0)
+        self.assertAlmostEqual(root.ns_per_s, 900e6)
+        self.assertAlmostEqual(root.calls_per_s, 500.0)
+        self.assertAlmostEqual(root.avg_ns, 900e6 / 500)
+        self.assertEqual(root.per_process, {fx.ROOT_PID: (900e6 * 5, 500 * 5)})
+        self.assertNotEqual(rows[0].key, rows[1].key)
+        multi = state_after(range(10, 21), threads=True, devices=4)
+        self.assertAlmostEqual(multi.table('threads')[0].share_pct, 90.0)
+        cumulative = state.table('threads', cumulative=True)
+        self.assertEqual(cumulative[0].value_ns, 900e6 * 20)
+
+    def test_threads_tab_absent_without_profile(self):
+        self.assertFalse(state_after(range(10, 21)).has_tab('threads'))
+
     def test_graph_rows(self):
         state = state_after(range(10, 21), graph_mode='graph')
         rows = state.table('graphs')

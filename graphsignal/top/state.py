@@ -37,6 +37,10 @@ TAB_PROFILES = {
     'memcpy': (('cuda_memcpy_nanoseconds', 'rocm_memcpy_nanoseconds'),
                ('cuda_memset_nanoseconds',)),
     'sync': (('cuda_sync_nanoseconds', 'rocm_sync_nanoseconds'),),
+    # Host side: on-CPU time per thread, from the watcher's /proc reader.
+    # Rows are per (process, thread), since every Python process has a
+    # `python3/main`; the share is of one CPU core, not of a GPU-second.
+    'threads': (('process_threads_cpu_nanoseconds',),),
 }
 # Byte counters matching the groups above, by frame kind.
 TAB_BYTES = {
@@ -44,7 +48,7 @@ TAB_BYTES = {
 }
 # Category label per (tab, group index) for tabs whose frames are kinds.
 TAB_GROUP_CATEGORY = {('memcpy', 0): 'memcpy', ('memcpy', 1): 'memset', ('sync', 0): 'sync'}
-TABS = ('kernels', 'graphs', 'memcpy', 'sync')
+TABS = ('kernels', 'graphs', 'memcpy', 'sync', 'threads')
 # The GPU-time breakdown keeps memset as its own share.
 GPU_TIME_PROFILES = {
     'kernels': ('cuda_kernels_nanoseconds', 'rocm_kernels_nanoseconds'),
@@ -695,6 +699,9 @@ class TopState:
                 frames, per_process, elapsed = self._profile_delta(name)
             if frames is None:
                 continue
+            if tab == 'threads':
+                rows.extend(self._thread_rows(name, per_process or {}, elapsed))
+                continue
             bytes_by_kind = self._bytes_by_kind(tab, group, cumulative)
             for frame, (value, samples) in frames.items():
                 category, label, short, kernel = self._name_for(tab, group, frame)
@@ -709,6 +716,24 @@ class TopState:
                     per_process={pid: fr[frame] for pid, fr in (per_process or {}).items() if frame in fr},
                     kernel=kernel))
         rows.sort(key=lambda r: (-r.value_ns, r.label))
+        return rows
+
+    @staticmethod
+    def _thread_rows(name, per_process, elapsed):
+        """One row per (process, thread). The share is of one CPU core: a
+        thread at 100% is a saturated core, the host-bound signature."""
+        rows = []
+        for pid, frames in per_process.items():
+            for frame, (value, samples) in frames.items():
+                share = (value / (elapsed * NS_PER_S) * 100.0) if elapsed else None
+                rows.append(FrameRow(
+                    key=f'{name}:{pid}:{frame}', category=f'pid {pid}',
+                    label=str(frame), short=str(frame), raw=str(frame),
+                    value_ns=value, samples=samples, share_pct=share,
+                    ns_per_s=(value / elapsed) if elapsed else None,
+                    calls_per_s=(samples / elapsed) if elapsed else None,
+                    avg_ns=(value / samples) if samples else None,
+                    per_process={pid: (value, samples)}))
         return rows
 
     def has_tab(self, tab):

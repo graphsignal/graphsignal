@@ -32,7 +32,7 @@ class HandleKeyTest(unittest.TestCase):
         self.assertEqual(self.ui.tab, 'graphs')
         self.key('m')
         self.assertEqual(self.ui.tab, 'memcpy')
-        self.key('t')   # no such tab: ignored
+        self.key('t')   # no thread profile in this payload: ignored
         self.assertEqual(self.ui.tab, 'memcpy')
         self.key('s')
         self.assertEqual(self.ui.tab, 'sync')

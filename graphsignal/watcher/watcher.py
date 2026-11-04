@@ -195,6 +195,7 @@ class Watcher:
                      metrics_host=self._metrics_host)))
         specs.extend([
             ('graphsignal.recorders.process_recorder', 'ProcessRecorder', {}),
+            ('graphsignal.recorders.thread_recorder', 'ThreadRecorder', {}),
             ('graphsignal.recorders.shm_recorder', 'ShmRecorder', {}),
         ])
         recorders = []
@@ -217,10 +218,12 @@ class Watcher:
 
     def on_child_created(self, pid, args):
         from graphsignal.recorders.process_recorder import ProcessRecorder
+        from graphsignal.recorders.thread_recorder import ThreadRecorder
         from graphsignal.recorders.shm_recorder import ShmRecorder
 
         recorders = [
             ProcessRecorder(root_pid=self._target_pid, pid=pid, args=args),
+            ThreadRecorder(root_pid=self._target_pid, pid=pid, args=args),
             ShmRecorder(root_pid=self._target_pid, pid=pid, args=args),
         ]
         with self._recorders_lock:

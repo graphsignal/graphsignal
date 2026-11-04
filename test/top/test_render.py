@@ -113,6 +113,33 @@ class FrameGeometryTest(unittest.TestCase):
         self.assertIn('5.0 MB/s', joined)
         self.assertIn('host to device', joined)
 
+    def test_threads_tab(self):
+        state = make_state(threads=True)
+        _, texts = render(state, UiState(tab='threads'))
+        joined = '\n'.join(texts)
+        title = next(t for t in texts if 'sorted by time' in t)
+        self.assertIn('THREADS  sorted by time', title)
+        self.assertIn('[t]hreads', title)
+        header = next(t for t in texts if 'THREAD' in t and 'CPU%' in t)
+        self.assertIn('sched/s', header)
+        self.assertIn('PROCESS', header)
+        self.assertIn('python3/main', joined)
+        self.assertIn('cuda-EvtHandlr', joined)
+        self.assertIn(f'pid {fx.ROOT_PID}', joined)
+        self.assertIn('90.0', joined)
+        # Without the profile the tab is not offered.
+        _, texts = render(make_state(), UiState(tab='kernels'))
+        self.assertNotIn('[t]hreads', next(t for t in texts if 'sorted by time' in t))
+
+    def test_threads_detail_overlay(self):
+        state = make_state(threads=True)
+        ui = UiState(tab='threads', overlay='detail')
+        _, texts = render(state, ui)
+        joined = '\n'.join(texts)
+        self.assertIn('thread', joined)
+        self.assertIn('sched', joined)
+        self.assertNotIn('calls', joined)
+
     def test_first_poll_shows_warming_up(self):
         _, texts = render(make_state(ts=[1]))
         joined = '\n'.join(texts)
