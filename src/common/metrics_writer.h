@@ -330,14 +330,26 @@ class MetricsWriter {
 
     dir_path_ = std::string(base) + "/graphsignal_" + std::to_string(pid_);
     if (mkdir(dir_path_.c_str(), 0700) != 0 && errno != EEXIST) return false;
-    file_path_ = dir_path_ + "/" + libname + ".json";
-    tmp_path_ = file_path_ + ".tmp";
+    dir_fd_ = open(dir_path_.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir_fd_ < 0) return false;
+    struct stat st;
+    if (fstat(dir_fd_, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+        ((st.st_mode & 077) != 0 && fchmod(dir_fd_, 0700) != 0)) {
+      close(dir_fd_);
+      dir_fd_ = -1;
+      return false;
+    }
+    file_name_ = std::string(libname) + ".json";
+    tmp_name_ = file_name_ + ".tmp";
+    file_path_ = dir_path_ + "/" + file_name_;
 
     capture_context();
 
     try {
       writer_thread_ = std::thread([this]() { writer_loop(); });
     } catch (...) {
+      close(dir_fd_);
+      dir_fd_ = -1;
       return false;
     }
     return true;
@@ -823,7 +835,10 @@ class MetricsWriter {
   }
 
   void write_file(const std::string& data) {
-    int fd = open(tmp_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (dir_fd_ < 0) return;
+    unlinkat(dir_fd_, tmp_name_.c_str(), 0);
+    int fd = openat(dir_fd_, tmp_name_.c_str(),
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return;
     const char* p = data.c_str();
     size_t rem = data.size();
@@ -832,14 +847,16 @@ class MetricsWriter {
       if (rc < 0) {
         if (errno == EINTR) continue;
         close(fd);
-        unlink(tmp_path_.c_str());
+        unlinkat(dir_fd_, tmp_name_.c_str(), 0);
         return;
       }
       p += rc;
       rem -= static_cast<size_t>(rc);
     }
     close(fd);
-    if (rename(tmp_path_.c_str(), file_path_.c_str()) != 0) unlink(tmp_path_.c_str());
+    if (renameat(dir_fd_, tmp_name_.c_str(), dir_fd_, file_name_.c_str()) != 0) {
+      unlinkat(dir_fd_, tmp_name_.c_str(), 0);
+    }
   }
 
   static const char* type_str(InstrumentType type) {
@@ -861,7 +878,9 @@ class MetricsWriter {
   uint64_t interval_ns_ = kDefaultIntervalNs;
   std::string dir_path_;
   std::string file_path_;
-  std::string tmp_path_;
+  std::string file_name_;
+  std::string tmp_name_;
+  int dir_fd_ = -1;
   std::vector<std::pair<std::string, std::string>> context_;
 
   std::mutex reg_mu_;

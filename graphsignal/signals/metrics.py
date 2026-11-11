@@ -16,6 +16,8 @@ CLEANUP_INTERVAL_NS = 60 * 1_000_000_000
 MAX_METRICS = 5000
 MAX_PROFILE_FRAMES = 250
 
+MAX_NAME_LEN = 250
+MAX_FRAME_NAME_LEN = 4096
 MAX_TAG_KEY_LEN = 50
 MAX_TAG_VALUE_LEN = 250
 
@@ -132,12 +134,12 @@ class MetricStore:
         # counters end to end — the probes record them as uint64 and the
         # upload proto declares uint64 — so anything float is truncated here,
         # at the door.
-        frames = {frame_name: int(value) for frame_name, value in frames.items()}
+        frames = _sum_by_frame_name(frames)
         if len(frames) > MAX_PROFILE_FRAMES:
             top = sorted(frames.items(), key=lambda kv: kv[1], reverse=True)
             frames = dict(top[:MAX_PROFILE_FRAMES])
-        samples = {frame_name: int(count)
-                   for frame_name, count in (samples or {}).items()
+        samples = {frame_name: count
+                   for frame_name, count in _sum_by_frame_name(samples or {}).items()
                    if frame_name in frames}
 
         with self._lock:
@@ -172,6 +174,7 @@ class MetricStore:
             for key, value in tags.items():
                 norm_tags[str(key)[:MAX_TAG_KEY_LEN]] = str(value)[:MAX_TAG_VALUE_LEN]
 
+        name = str(name)[:MAX_NAME_LEN]
         metric_key = (name, metric_type, frozenset(norm_tags.items()))
         metric = self._metrics.get(metric_key)
         if metric is None:
@@ -200,3 +203,13 @@ class MetricStore:
                 expired_keys.append(metric_key)
         for metric_key in expired_keys:
             del self._metrics[metric_key]
+
+
+def _sum_by_frame_name(values):
+    """Frame values keyed by name capped at MAX_FRAME_NAME_LEN; frames whose
+    capped names coincide are summed."""
+    summed = {}
+    for frame_name, value in values.items():
+        frame_name = str(frame_name)[:MAX_FRAME_NAME_LEN]
+        summed[frame_name] = summed.get(frame_name, 0) + int(value)
+    return summed

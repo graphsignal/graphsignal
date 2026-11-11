@@ -3,9 +3,13 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
 import graphsignal.watcher
+from graphsignal.recorders import shm_files
+from graphsignal.recorders import shm_recorder as shm_recorder_mod
 from graphsignal.recorders.shm_recorder import ShmRecorder
 from test.test_utils import configure_test_watcher, find_metric
 
@@ -252,6 +256,87 @@ class ShmRecorderImportTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(self.shm_dir))
         self.recorder.shutdown()
         self.assertFalse(os.path.isdir(self.shm_dir))
+
+
+class ShmRecorderUntrustedDirTest(unittest.TestCase):
+    def setUp(self):
+        self.watcher = configure_test_watcher()
+        self.base_dir = tempfile.mkdtemp()
+        self.pid = os.getpid()
+        self.shm_dir = os.path.join(self.base_dir, f'graphsignal_{self.pid}')
+        self.recorder = ShmRecorder(
+            root_pid=self.pid, pid=self.pid, shm_base_dir=self.base_dir)
+
+    def tearDown(self):
+        graphsignal.watcher.shutdown()
+        shutil.rmtree(self.base_dir, ignore_errors=True)
+
+    def _payload(self, name='g1'):
+        return json.dumps({
+            'version': 1, 'pid': self.pid, 'start_ts': 1, 'write_ts': 2,
+            'metrics': [{'name': name, 'type': 'gauge', 'value': 1}]})
+
+    def _names(self):
+        return {m.name for m in self.watcher.metric_store().export()}
+
+    def test_fifo_does_not_block_the_tick(self):
+        os.makedirs(self.shm_dir)
+        os.mkfifo(os.path.join(self.shm_dir, 'a.json'))
+        with open(os.path.join(self.shm_dir, 'b.json'), 'w') as f:
+            f.write(self._payload())
+
+        thread = threading.Thread(target=self.recorder.on_tick, daemon=True)
+        thread.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self._names(), {'g1'})
+
+    def test_symlinked_file_is_not_read(self):
+        os.makedirs(self.shm_dir)
+        outside = os.path.join(self.base_dir, 'outside.json')
+        with open(outside, 'w') as f:
+            f.write(self._payload('outside'))
+        os.symlink(outside, os.path.join(self.shm_dir, 'a.json'))
+
+        self.recorder.on_tick()
+        self.assertEqual(self._names(), set())
+
+    def test_symlinked_dir_is_not_read(self):
+        elsewhere = os.path.join(self.base_dir, 'elsewhere')
+        os.makedirs(elsewhere)
+        with open(os.path.join(elsewhere, 'a.json'), 'w') as f:
+            f.write(self._payload())
+        os.symlink(elsewhere, self.shm_dir)
+
+        self.recorder.on_tick()
+        self.assertEqual(self._names(), set())
+
+    def test_dir_of_another_user_is_not_read(self):
+        os.makedirs(self.shm_dir)
+        with open(os.path.join(self.shm_dir, 'a.json'), 'w') as f:
+            f.write(self._payload())
+        with patch.object(shm_files.os, 'geteuid', return_value=os.geteuid() + 1), \
+                patch.object(shm_files, '_process_uid', return_value=os.geteuid() + 1):
+            self.recorder.on_tick()
+        self.assertEqual(self._names(), set())
+
+    @unittest.skipUnless(os.path.isdir('/proc/self'), 'needs /proc')
+    def test_dir_of_the_observed_process_user_is_read(self):
+        os.makedirs(self.shm_dir)
+        with open(os.path.join(self.shm_dir, 'a.json'), 'w') as f:
+            f.write(self._payload())
+        with patch.object(shm_files.os, 'geteuid', return_value=os.geteuid() + 1):
+            self.recorder.on_tick()
+        self.assertEqual(self._names(), {'g1'})
+
+    def test_oversized_file_is_skipped(self):
+        os.makedirs(self.shm_dir)
+        with open(os.path.join(self.shm_dir, 'a.json'), 'w') as f:
+            f.write(self._payload())
+        with patch.object(shm_recorder_mod, 'MAX_FILE_BYTES', 16):
+            self.recorder.on_tick()
+        self.assertEqual(self._names(), set())
+
 
 
 class SweepStaleDirsTest(unittest.TestCase):

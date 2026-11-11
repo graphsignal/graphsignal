@@ -1,4 +1,5 @@
 import os
+import socket
 import unittest
 import urllib.request
 
@@ -123,20 +124,27 @@ class WatcherConfigureTest(unittest.TestCase):
         resources = watcher.resource_store().export()
         self.assertTrue(any(r['kind'] == 'process' for r in resources))
 
-    def test_listen_port_conflict_disables_endpoint(self):
+    def test_listen_port_conflict_fails_setup(self):
         port = free_port()
         first = self._configure(listen_port=port)
         self.assertTrue(first.signals_endpoint().is_running())
 
-        # A second endpoint on the same port logs and disables itself; the
-        # watcher must not crash.
         second = Watcher(target_pid=os.getpid(), listen_port=port)
         second._auto_tick = False
-        second.setup()
         try:
-            self.assertFalse(second.signals_endpoint().is_running())
+            with self.assertRaises(OSError):
+                second.setup()
         finally:
             second.shutdown()
+
+    def test_configure_on_busy_port_raises_and_leaves_nothing_configured(self):
+        port = free_port()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+            holder.bind(('127.0.0.1', port))
+            holder.listen(1)
+            with self.assertRaises(OSError):
+                self._configure(listen_port=port)
+        self.assertFalse(graphsignal.watcher.is_configured())
 
 
 if __name__ == '__main__':

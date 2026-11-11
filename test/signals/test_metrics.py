@@ -352,5 +352,25 @@ class MetricStoreThreadSafetyTest(unittest.TestCase):
         self.assertIn('value', metric.datapoint)
 
 
+class MetricStoreNameCapTest(unittest.TestCase):
+    def test_metric_name_truncated(self):
+        store = MetricStore()
+        store._last_cleanup_ts = time.time_ns()
+        store.set_gauge('n' * 1000, 1.0, measurement_ts=10)
+        self.assertEqual(store.export()[0].name, 'n' * 250)
+
+    def test_frame_names_truncated_and_merged(self):
+        store = MetricStore()
+        store._last_cleanup_ts = time.time_ns()
+        prefix = 'f' * 4096
+        store.set_profile('p1', frames={prefix + 'a': 2, prefix + 'b': 3, 'short': 1},
+                          samples={prefix + 'a': 1, prefix + 'b': 1, 'short': 4},
+                          measurement_ts=10)
+        datapoint = store.export()[0].datapoint
+        self.assertEqual(datapoint['frames'], {prefix: 5, 'short': 1})
+        self.assertEqual(datapoint['samples'], {prefix: 2, 'short': 4})
+
+
+
 if __name__ == '__main__':
     unittest.main()

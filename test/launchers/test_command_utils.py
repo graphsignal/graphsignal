@@ -1,12 +1,15 @@
+import socket
 import subprocess
 import sys
+import threading
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
 from graphsignal.launchers import command_utils
 from graphsignal.launchers.command_utils import (
-    extract_host, extract_port, resolve_metrics_host, resolve_metrics_port,
-    start_watcher)
+    bind_listen_socket, extract_host, extract_port, resolve_metrics_host,
+    resolve_metrics_port, start_watcher)
 
 
 class RemovedHelpersTest(unittest.TestCase):
@@ -152,6 +155,54 @@ class StartWatcherTest(unittest.TestCase):
         with patch.object(subprocess, 'Popen', side_effect=OSError('boom')):
             result = start_watcher(1)
         self.assertIsNone(result)
+
+
+class ListenSocketTest(unittest.TestCase):
+    def test_binds_a_free_port(self):
+        sock = bind_listen_socket('127.0.0.1', 0)
+        try:
+            self.assertGreater(sock.getsockname()[1], 0)
+        finally:
+            sock.close()
+
+    def test_busy_port_raises_after_timeout(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+            holder.bind(('127.0.0.1', 0))
+            holder.listen(1)
+            started = time.monotonic()
+            with self.assertRaises(OSError):
+                bind_listen_socket('127.0.0.1', holder.getsockname()[1], timeout=0.3)
+            self.assertGreaterEqual(time.monotonic() - started, 0.3)
+
+    def test_waits_for_a_port_that_frees_up(self):
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        holder.bind(('127.0.0.1', 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+        threading.Timer(0.3, holder.close).start()
+        sock = bind_listen_socket('127.0.0.1', port, timeout=10)
+        try:
+            self.assertEqual(sock.getsockname()[1], port)
+        finally:
+            sock.close()
+
+    def test_unbindable_address_raises_at_once(self):
+        started = time.monotonic()
+        with self.assertRaises(OSError):
+            bind_listen_socket('203.0.113.1', 0, timeout=10)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_watcher_inherits_the_socket(self):
+        sock = bind_listen_socket('127.0.0.1', 0)
+        try:
+            with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
+                start_watcher(54321, listen_socket=sock)
+            cmd = popen_m.call_args[0][0]
+            self.assertEqual(cmd[-2:], ['--listen-fd', str(sock.fileno())])
+            self.assertEqual(popen_m.call_args[1]['pass_fds'], (sock.fileno(),))
+        finally:
+            sock.close()
+
 
 
 if __name__ == '__main__':

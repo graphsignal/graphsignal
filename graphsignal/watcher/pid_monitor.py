@@ -1,10 +1,40 @@
 import logging
 import os
+import re
 import threading
 
 import psutil
 
 logger = logging.getLogger('graphsignal')
+
+
+REDACTED = '[redacted]'
+
+# Flags whose value is a credential: `--api-key`, `--hf-token`, `--password`, ...
+_CREDENTIAL_FLAG_RE = re.compile(
+    r'^--?(?:[a-z0-9]+[-_])*'
+    r'(?:api[-_]?key|access[-_]?key|secret[-_]?key|token|secret|password|passwd|credentials?)$',
+    re.IGNORECASE)
+
+
+def redact_command_line(cmdline):
+    """Join argv into one string, with the values of credential flags replaced."""
+    parts = []
+    redact_next = False
+    for arg in cmdline:
+        if redact_next:
+            redact_next = False
+            if not arg.startswith('-'):
+                parts.append(REDACTED)
+                continue
+        flag, sep, _ = arg.partition('=')
+        if _CREDENTIAL_FLAG_RE.match(flag):
+            if sep:
+                parts.append(f'{flag}={REDACTED}')
+                continue
+            redact_next = True
+        parts.append(arg)
+    return ' '.join(parts)
 
 
 class PidMonitor:
@@ -132,4 +162,4 @@ def _read_args(proc) -> str:
         return ''
     if not cmdline:
         return ''
-    return ' '.join(cmdline)
+    return redact_command_line(cmdline)

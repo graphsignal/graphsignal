@@ -9,7 +9,9 @@ null = not measured, 0 = measured zero.
 scrapers (see prometheus.py).
 """
 
+import hmac
 import http.server
+import ipaddress
 import json
 import logging
 import math
@@ -175,18 +177,43 @@ def build_payload():
     return payload
 
 
+def _is_loopback(host):
+    if host == 'localhost':
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _host_header_name(value):
+    """The host part of a Host header, lowercased, without port or brackets."""
+    value = value.strip().lower()
+    if value.startswith('['):
+        return value[1:].split(']', 1)[0]
+    return value.rsplit(':', 1)[0] if ':' in value else value
+
+
 class _SignalsRequestHandler(http.server.BaseHTTPRequestHandler):
+    # Seconds a connection may stay idle mid-request or mid-response.
+    timeout = 10
+
     def do_GET(self):
         try:
-            if self.path == '/signals':
-                self._respond_json(200, build_payload())
-            elif self.path == '/metrics':
-                self._respond_text(200, prometheus.render_metrics(),
-                                   prometheus.CONTENT_TYPE)
+            if not self._host_allowed():
+                self._respond_json(403, {'error': 'forbidden'})
             elif self.path == '/health':
                 self._respond_json(200, {'status': 'ok'})
-            else:
+            elif self.path not in ('/signals', '/metrics'):
                 self._respond_json(404, {'error': 'not found'})
+            elif not self._authorized():
+                self._respond_json(401, {'error': 'unauthorized'},
+                                   headers={'WWW-Authenticate': 'Bearer'})
+            elif self.path == '/signals':
+                self._respond_json(200, build_payload())
+            else:
+                self._respond_text(200, prometheus.render_metrics(),
+                                   prometheus.CONTENT_TYPE)
         except Exception:
             logger.error('Error handling signals request', exc_info=True)
             try:
@@ -194,11 +221,31 @@ class _SignalsRequestHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _respond_json(self, status, payload):
+    def _host_allowed(self):
+        if not self.server.loopback_only:
+            return True
+        host = self.headers.get('Host')
+        if host is None:
+            return True
+        return _is_loopback(_host_header_name(host))
+
+    def _authorized(self):
+        token = self.server.token
+        if not token:
+            return True
+        scheme, _, credentials = (self.headers.get('Authorization') or '').partition(' ')
+        if scheme.lower() != 'bearer':
+            return False
+        return hmac.compare_digest(credentials.strip().encode('utf-8'),
+                                   token.encode('utf-8'))
+
+    def _respond_json(self, status, payload, headers=None):
         body = json.dumps(payload).encode('utf-8')
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -214,27 +261,64 @@ class _SignalsRequestHandler(http.server.BaseHTTPRequestHandler):
         logger.debug('signals endpoint: ' + format, *args)
 
 
+class _SignalsServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    # Connections served at once; one over the limit is closed unanswered.
+    MAX_CONNECTIONS = 32
+
+    def __init__(self, address, handler, sock=None, token=None, loopback_only=False):
+        super().__init__(address, handler, bind_and_activate=False)
+        self.token = token
+        self.loopback_only = loopback_only
+        self._slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
+        try:
+            if sock is not None:
+                self.socket.close()
+                self.socket = sock
+                self.server_address = sock.getsockname()
+            else:
+                self.server_bind()
+            self.server_activate()
+        except BaseException:
+            self.server_close()
+            raise
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 class SignalsEndpoint:
     """The watcher's HTTP listener: /signals (JSON), /metrics (Prometheus
-    text) and /health."""
+    text) and /health.
 
-    # A busy port at startup is usually the previous run's watcher finishing
-    # its last tick, so the bind is retried for a while before giving up.
-    BIND_RETRY_INTERVAL_S = 2.0
-    BIND_RETRY_TIMEOUT_S = 120.0
+    `sock` is an already bound socket to serve on (graphsignal-run binds the
+    address before it starts the workload and hands it over); without one the
+    endpoint binds `host:port` itself. `token`, when set, is the bearer token
+    /signals and /metrics require.
+    """
 
     def __init__(self, host=DEFAULT_LISTEN_HOST, port=DEFAULT_LISTEN_PORT,
-                 bind_retry_interval=None, bind_retry_timeout=None):
+                 sock=None, token=None):
         self._host = str(host)
         self._port = int(port)
+        self._sock = sock
+        self._token = token
         self._server = None
         self._serve_thread = None
-        self._retry_thread = None
-        self._stopped = threading.Event()
-        self._retry_interval = (self.BIND_RETRY_INTERVAL_S if bind_retry_interval is None
-                                else float(bind_retry_interval))
-        self._retry_timeout = (self.BIND_RETRY_TIMEOUT_S if bind_retry_timeout is None
-                               else float(bind_retry_timeout))
 
     def host(self):
         return self._host
@@ -246,44 +330,26 @@ class SignalsEndpoint:
         return self._server is not None
 
     def setup(self):
-        if self._bind():
-            return
-        if self._retry_timeout <= 0:
-            logger.error('Signals endpoint failed to bind %s:%d', self._host, self._port)
-            return
-        logger.warning('Signals endpoint could not bind %s:%d; retrying for up to %.0fs',
-                       self._host, self._port, self._retry_timeout)
-        self._retry_thread = threading.Thread(target=self._retry_bind, daemon=True)
-        self._retry_thread.start()
-
-    def _bind(self):
-        """One bind attempt; True when the endpoint is serving."""
+        """Start serving. Raises OSError when the address cannot be bound."""
+        sock, self._sock = self._sock, None
         try:
-            server = http.server.ThreadingHTTPServer(
-                (self._host, self._port), _SignalsRequestHandler)
+            server = _SignalsServer(
+                (self._host, self._port), _SignalsRequestHandler,
+                sock=sock, token=self._token,
+                loopback_only=_is_loopback(self._host))
         except OSError as exc:
-            logger.debug('Signals endpoint bind %s:%d: %s', self._host, self._port, exc)
-            return False
-        server.daemon_threads = True
+            logger.error('Signals endpoint failed to bind %s:%d: %s',
+                         self._host, self._port, exc)
+            raise
         self._server = server
         self._serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
         self._serve_thread.start()
         logger.debug('Signals endpoint listening on %s:%d', self._host, self._port)
-        return True
-
-    def _retry_bind(self):
-        deadline = time.monotonic() + self._retry_timeout
-        while not self._stopped.is_set() and time.monotonic() < deadline:
-            if self._stopped.wait(self._retry_interval):
-                return
-            if self._bind():
-                return
-        if not self._stopped.is_set():
-            logger.error('Signals endpoint failed to bind %s:%d after %.0fs; endpoint disabled',
-                         self._host, self._port, self._retry_timeout)
 
     def shutdown(self):
-        self._stopped.set()
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
         if self._server is None:
             return
         try:

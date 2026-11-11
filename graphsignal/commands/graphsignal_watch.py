@@ -15,6 +15,7 @@ Usage:
                     [--metrics-port PORT] [--metrics-path PATH]
                     [--metrics-host HOST]
                     [--listen-host HOST] [--listen-port PORT]
+                    [--listen-fd FD]
 """
 
 
@@ -41,6 +42,10 @@ def main():
     parser.add_argument('--listen-port', type=int, default=None,
                         help='Port for the local /signals HTTP endpoint '
                              '(default: 18259)')
+    parser.add_argument('--listen-fd', type=int, default=None,
+                        help='File descriptor of an already bound socket to '
+                             'serve the /signals HTTP endpoint on, instead of '
+                             'binding --listen-host/--listen-port')
     args = parser.parse_args()
 
     try:
@@ -51,6 +56,7 @@ def main():
             metrics_host=args.metrics_host,
             listen_host=args.listen_host,
             listen_port=args.listen_port,
+            listen_fd=args.listen_fd,
         )
     except Exception as exc:
         log.error('graphsignal-watch: profiler failed to configure: %s', exc, exc_info=True)

@@ -66,8 +66,8 @@ Options (before the command):
 | --- | --- |
 | `--version` | Print the profiler version and exit. |
 | `--metrics-port PORT` | Port to scrape the engine's Prometheus metrics on (default: derived from the engine's `--port`). |
-| `--listen-host HOST` | Host to bind the `/signals` and `/metrics` endpoint to (default: `127.0.0.1`). Set e.g. `0.0.0.0` to expose it for remote access — anything on that network can then read it. |
-| `--listen-port PORT` | Port for the `/signals` and `/metrics` endpoint (default: `18259`). |
+| `--listen-host HOST` | Host to bind the `/signals` and `/metrics` endpoint to (default: `127.0.0.1`). Set e.g. `0.0.0.0` to expose it for remote access — anything on that network can then read it. Set `GRAPHSIGNAL_LISTEN_TOKEN` in the environment of `graphsignal-run` to require `Authorization: Bearer <token>` on `/signals` and `/metrics` (`401` without it; `/health` stays open); `graphsignal-top` reads the same variable. The endpoint is plain HTTP, so the token is not encrypted in transit. |
+| `--listen-port PORT` | Port for the `/signals` and `/metrics` endpoint (default: `18259`). If the port is busy, `graphsignal-run` exits with an error instead of starting the workload. |
 | `--cuda-graph-trace {graph\|node}` | Granularity for CUDA graph launches (default: `graph`). `graph` times each replay as a whole into `cuda_graphs_nanoseconds`; `node` times the kernels inside the graph individually into `cuda_kernels_nanoseconds`. Also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`; the flag wins. |
 | `--rocm-kernel-trace {none\|all}` | Per-kernel tracing on ROCm (default: `none`). `all` times every kernel dispatch into `rocm_kernels_nanoseconds`. rocprofiler-sdk charges tens of microseconds per dispatch for it, so this is an investigation mode, not for production (see [Overhead](#overhead)). Also settable via `GRAPHSIGNAL_ROCM_KERNEL_TRACE`; the flag wins. |
 
@@ -238,7 +238,7 @@ What each mode costs, measured, and the method behind the numbers: [Profiler Ove
 
 ## Security and privacy
 
-The profiler runs as a sidecar process and does not require root or elevated privileges. Its `/signals` and `/metrics` endpoint binds to `127.0.0.1` by default — when no listen host is specified, it is not reachable from outside the machine. Binding another host with `--listen-host` is an explicit opt-in that exposes the endpoint for remote access; it is read-only but unauthenticated, so restrict access at the network level.
+The profiler runs as a sidecar process and does not require root or elevated privileges. Its `/signals` and `/metrics` endpoint binds to `127.0.0.1` by default — when no listen host is specified, it is not reachable from outside the machine. Binding another host with `--listen-host` is an explicit opt-in that exposes the endpoint for remote access; it is read-only but unauthenticated, so restrict access at the network level, or set `GRAPHSIGNAL_LISTEN_TOKEN` to require `Authorization: Bearer <token>` on `/signals` and `/metrics` (`graphsignal-top` reads the same variable). The values of credential flags on profiled command lines (`--api-key`, `--hf-token`, `--password`, …) are replaced with `[redacted]`. `graphsignal-run` binds the listen address before it starts the workload and exits with an error, without launching it, when the port is taken.
 
 Signals are uploaded only when `GRAPHSIGNAL_API_KEY` is set, and only to the server it reports to. Without the key, no profiling data ever leaves the machine. Remote commands are not possible in any configuration.
 

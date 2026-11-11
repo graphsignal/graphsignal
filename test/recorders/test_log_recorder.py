@@ -3,11 +3,13 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
 import graphsignal.watcher
 from graphsignal.recorders import log_recorder as log_recorder_mod
+from graphsignal.recorders import shm_files
 from graphsignal.recorders.log_recorder import (
     LogRecorder, _StreamExtractor, _sweep_stale_shm_dirs)
 from test.test_utils import configure_test_watcher
@@ -358,6 +360,78 @@ class LogRecorderDrainTest(unittest.TestCase):
 
         self.assertEqual(self._workload_entries(), [])
         self.assertFalse(os.path.isdir(self.shm_dir))
+
+
+class LogRecorderUntrustedDirTest(unittest.TestCase):
+    def setUp(self):
+        self.watcher = configure_test_watcher()
+        self.base = tempfile.mkdtemp()
+        self.shm_dir = os.path.join(self.base, 'graphsignal_log_1')
+        self.recorder = LogRecorder(root_pid=os.getpid(), pid=os.getpid(), args='x')
+        self.recorder._disabled = False
+        self.shm_patch = patch.object(
+            self.recorder, '_shm_dir', return_value=self.shm_dir)
+        self.shm_patch.start()
+
+    def tearDown(self):
+        self.shm_patch.stop()
+        shutil.rmtree(self.base, ignore_errors=True)
+        graphsignal.watcher.shutdown()
+
+    def _segment(self, path, message='boom'):
+        with open(path, 'w') as f:
+            f.write(json.dumps({'ts': 1000, 'stream': 'stderr',
+                                'line': f'ERROR: {message}'}) + '\n')
+
+    def _messages(self):
+        return [e['message'] for e in self.watcher.log_store().export()
+                if e['tags'].get('scope.name') == 'workload']
+
+    def test_symlinked_segment_and_fifo_are_skipped(self):
+        os.makedirs(self.shm_dir)
+        outside = os.path.join(self.base, 'outside.jsonl')
+        self._segment(outside, 'outside')
+        os.symlink(outside, os.path.join(self.shm_dir, 'log_0.jsonl'))
+        os.mkfifo(os.path.join(self.shm_dir, 'log_1.jsonl'))
+        self._segment(os.path.join(self.shm_dir, 'log_2.jsonl'), 'real')
+
+        thread = threading.Thread(target=self.recorder.finalize, daemon=True)
+        thread.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self._messages(), ['real'])
+
+    def test_symlinked_dir_is_not_read(self):
+        elsewhere = os.path.join(self.base, 'elsewhere')
+        os.makedirs(elsewhere)
+        self._segment(os.path.join(elsewhere, 'log_0.jsonl'))
+        os.symlink(elsewhere, self.shm_dir)
+
+        self.recorder.finalize()
+        self.assertEqual(self._messages(), [])
+
+    def test_dir_of_another_user_is_not_read(self):
+        os.makedirs(self.shm_dir)
+        self._segment(os.path.join(self.shm_dir, 'log_0.jsonl'))
+        with patch.object(shm_files.os, 'geteuid', return_value=os.geteuid() + 1):
+            self.recorder.finalize()
+        self.assertEqual(self._messages(), [])
+
+    def test_record_longer_than_a_pass_is_skipped_not_reread(self):
+        os.makedirs(self.shm_dir)
+        path = os.path.join(self.shm_dir, 'log_0.jsonl')
+        with open(path, 'w') as f:
+            f.write('x' * 200)
+        with patch.object(log_recorder_mod, 'MAX_BYTES_PER_DRAIN', 64):
+            for _ in range(4):
+                self.recorder.on_tick()
+        self.assertEqual(self.recorder._offsets[path], 192)
+        with open(path, 'a') as f:
+            f.write('\n' + json.dumps({'ts': 1000, 'stream': 'stderr',
+                                       'line': 'ERROR: after'}) + '\n')
+        self.recorder.finalize()
+        self.assertEqual(self._messages(), ['after'])
+
 
 
 class SweepStaleShmDirsTest(unittest.TestCase):

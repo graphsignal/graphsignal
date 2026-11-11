@@ -31,6 +31,8 @@ def configure(
     metrics_host: Optional[str] = None,
     listen_host: Optional[str] = None,
     listen_port: Optional[int] = None,
+    listen_fd: Optional[int] = None,
+    listen_token: Optional[str] = None,
 ) -> None:
     global _watcher
 
@@ -50,6 +52,7 @@ def configure(
         "listen_host", str, listen_host, default_value=DEFAULT_LISTEN_HOST)
     listen_port = read_config_param(
         "listen_port", int, listen_port, default_value=DEFAULT_LISTEN_PORT)
+    listen_token = read_config_param("listen_token", str, listen_token)
 
     if target_pid is None:
         target_pid = os.getpid()
@@ -64,8 +67,19 @@ def configure(
         metrics_path=metrics_path,
         metrics_host=metrics_host,
         listen_host=listen_host,
-        listen_port=listen_port)
-    _watcher.setup()
+        listen_port=listen_port,
+        listen_fd=listen_fd,
+        listen_token=listen_token)
+    try:
+        _watcher.setup()
+    except Exception:
+        failed, _watcher = _watcher, None
+        failed._auto_tick = False
+        try:
+            failed.shutdown()
+        except Exception:
+            pass
+        raise
 
     atexit.register(shutdown)
 

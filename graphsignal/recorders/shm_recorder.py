@@ -17,11 +17,15 @@ import time
 import graphsignal
 import graphsignal.watcher
 from graphsignal.recorders.base_recorder import BaseRecorder
+from graphsignal.recorders.shm_files import is_owned_dir, read_regular_file
 
 logger = logging.getLogger('graphsignal')
 
 _SHM_BASE = '/dev/shm'
 _SHM_DIR_PREFIX = 'graphsignal_'
+
+# A metrics file is a full cumulative snapshot; anything larger is not read.
+MAX_FILE_BYTES = 32 * 1024 * 1024
 
 # Context keys published by metric writers, mapped to metric tags.
 _CONTEXT_TAG_MAP = {
@@ -66,15 +70,17 @@ class ShmRecorder(BaseRecorder):
         if self.pid is None:
             return
         shm_dir = self.shm_dir()
-        if not os.path.isdir(shm_dir):
+        if not is_owned_dir(shm_dir, self.pid):
             return
 
         watcher = graphsignal.watcher.watcher()
         for filepath in sorted(glob.glob(os.path.join(shm_dir, '*.json'))):
+            raw = read_regular_file(filepath, MAX_FILE_BYTES + 1)
+            if raw is None or len(raw) > MAX_FILE_BYTES:
+                continue
             try:
-                with open(filepath, 'r') as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError):
+                data = json.loads(raw)
+            except ValueError:
                 continue
             try:
                 self._import_file(watcher, filepath, data)

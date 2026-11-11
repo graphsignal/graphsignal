@@ -1,11 +1,39 @@
+import errno
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import time
 from typing import List, Optional
 
 logger = logging.getLogger('graphsignal')
+
+# A busy listen port is usually the previous run's watcher finishing its last
+# tick, so the bind is retried for a while before the launch is failed.
+LISTEN_BIND_TIMEOUT_SEC = 30.0
+LISTEN_BIND_INTERVAL_SEC = 0.25
+
+
+def bind_listen_socket(host: str, port: int,
+                       timeout: Optional[float] = None) -> socket.socket:
+    """Bind the watcher's listen address; raises OSError when it cannot be
+    bound (a port still busy after `timeout` seconds included)."""
+    if timeout is None:
+        timeout = LISTEN_BIND_TIMEOUT_SEC
+    deadline = time.monotonic() + timeout
+    while True:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, int(port)))
+            return sock
+        except OSError as exc:
+            sock.close()
+            if exc.errno != errno.EADDRINUSE or time.monotonic() >= deadline:
+                raise
+        time.sleep(LISTEN_BIND_INTERVAL_SEC)
 
 
 def resolve_executable(name: str) -> Optional[str]:
@@ -77,8 +105,12 @@ def start_watcher(pid: int,
                   metrics_path: Optional[str] = None,
                   metrics_host: Optional[str] = None,
                   listen_host: Optional[str] = None,
-                  listen_port: Optional[int] = None) -> Optional[subprocess.Popen]:
-    """Spawn the graphsignal-watch subprocess to observe the given pid."""
+                  listen_port: Optional[int] = None,
+                  listen_socket: Optional[socket.socket] = None) -> Optional[subprocess.Popen]:
+    """Spawn the graphsignal-watch subprocess to observe the given pid.
+
+    `listen_socket` is an already bound socket the watcher serves its endpoint
+    on instead of binding `listen_host:listen_port` itself."""
     cmd = [
         sys.executable,
         '-m', 'graphsignal.commands.graphsignal_watch',
@@ -94,6 +126,10 @@ def start_watcher(pid: int,
         cmd.extend(['--listen-host', str(listen_host)])
     if listen_port is not None:
         cmd.extend(['--listen-port', str(int(listen_port))])
+    pass_fds = ()
+    if listen_socket is not None:
+        cmd.extend(['--listen-fd', str(listen_socket.fileno())])
+        pass_fds = (listen_socket.fileno(),)
 
     logger.debug('Starting graphsignal-watch: %s', ' '.join(cmd))
     try:
@@ -104,6 +140,7 @@ def start_watcher(pid: int,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             close_fds=True,
+            pass_fds=pass_fds,
         )
     except Exception as exc:
         logger.error('Failed to start graphsignal-watch: %s', exc, exc_info=True)

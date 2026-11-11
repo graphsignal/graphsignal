@@ -732,6 +732,72 @@ static void test_probe_merge() {
   w->shutdown();
 }
 
+static void test_private_dir() {
+  CASE("private dir");
+
+  const std::string pid_dir_name = "/graphsignal_" + std::to_string(getpid());
+
+  // A fresh directory is created for the owner alone.
+  {
+    std::string dir = make_temp_dir();
+    graphsignal::MetricsWriter* w =
+        graphsignal::MetricsWriter::init("cupti", dir.c_str(), kLongIntervalNs, false);
+    ASSERT(w != NULL, "init must return a writer");
+    w->write_now(false);
+    struct stat st;
+    ASSERT(stat(w->dir_path().c_str(), &st) == 0, "dir must exist");
+    ASSERT_EQ((uint64_t)(st.st_mode & 0777), (uint64_t)0700, "dir must be 0700");
+    ASSERT(stat(w->file_path().c_str(), &st) == 0, "file must exist");
+    ASSERT_EQ((uint64_t)(st.st_mode & 0777), (uint64_t)0600, "file must be 0600");
+    w->shutdown();
+  }
+
+  // An existing directory of the same owner is reused and tightened, and a
+  // symlink waiting at the tmp name is replaced, never written through.
+  {
+    std::string dir = make_temp_dir();
+    std::string pid_dir = dir + pid_dir_name;
+    ASSERT(mkdir(pid_dir.c_str(), 0777) == 0, "mkdir must succeed");
+    ASSERT(chmod(pid_dir.c_str(), 0777) == 0, "chmod must succeed");
+    std::string victim = dir + "/victim";
+    FILE* f = std::fopen(victim.c_str(), "w");
+    ASSERT(f != NULL, "victim must be creatable");
+    std::fputs("untouched", f);
+    std::fclose(f);
+    ASSERT(symlink(victim.c_str(), (pid_dir + "/cupti.json.tmp").c_str()) == 0,
+           "symlink must succeed");
+    ASSERT(symlink(victim.c_str(), (pid_dir + "/cupti.json").c_str()) == 0,
+           "symlink must succeed");
+
+    graphsignal::MetricsWriter* w =
+        graphsignal::MetricsWriter::init("cupti", dir.c_str(), kLongIntervalNs, false);
+    ASSERT(w != NULL, "init must reuse the owner's directory");
+    w->write_now(false);
+    w->write_now(false);
+    ASSERT(read_file(victim) == "untouched", "the symlink target must not be written");
+    struct stat st;
+    ASSERT(lstat(w->file_path().c_str(), &st) == 0 && S_ISREG(st.st_mode),
+           "the output must be a regular file");
+    assert_well_formed(read_file(w->file_path()));
+    ASSERT(stat(pid_dir.c_str(), &st) == 0, "dir must exist");
+    ASSERT_EQ((uint64_t)(st.st_mode & 0777), (uint64_t)0700, "dir must be tightened to 0700");
+    w->shutdown();
+  }
+
+  // A symlink in place of the directory is refused.
+  {
+    std::string dir = make_temp_dir();
+    std::string elsewhere = make_temp_dir();
+    ASSERT(symlink(elsewhere.c_str(), (dir + pid_dir_name).c_str()) == 0,
+           "symlink must succeed");
+    graphsignal::MetricsWriter* w =
+        graphsignal::MetricsWriter::init("cupti", dir.c_str(), kLongIntervalNs, false);
+    ASSERT(w == NULL, "init must refuse a symlinked directory");
+    ASSERT(!file_exists(elsewhere + "/cupti.json"), "nothing may be written elsewhere");
+    ASSERT(!file_exists(elsewhere + "/cupti.json.tmp"), "nothing may be written elsewhere");
+  }
+}
+
 static void test_shutdown() {
   CASE("shutdown");
 
@@ -778,6 +844,7 @@ int main() {
   test_flush_hook();
   test_probe_merge();
   test_device_probe_reader();
+  test_private_dir();
   test_shutdown();
 
   std::printf("All common tests passed!\n");

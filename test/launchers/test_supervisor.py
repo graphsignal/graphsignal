@@ -2,11 +2,13 @@ import glob
 import json
 import os
 import shutil
+import socket
+import stat
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from graphsignal.launchers import supervisor
+from graphsignal.launchers import command_utils, supervisor
 from graphsignal.launchers.supervisor import _SegmentWriter, launch_supervised
 
 
@@ -20,10 +22,15 @@ class SupervisorLaunchTest(unittest.TestCase):
         self.shm_patch = patch.object(supervisor, '_SHM_BASE', self.shm_base)
         self.watcher_patch = patch.object(
             supervisor, 'start_watcher', return_value=MagicMock())
+        self.listen_socket = MagicMock(name='listen_socket')
+        self.bind_patch = patch.object(
+            supervisor, 'bind_listen_socket', return_value=self.listen_socket)
         self.shm_patch.start()
         self.start_watcher_m = self.watcher_patch.start()
+        self.bind_m = self.bind_patch.start()
 
     def tearDown(self):
+        self.bind_patch.stop()
         self.watcher_patch.stop()
         self.shm_patch.stop()
         shutil.rmtree(self.shm_base, ignore_errors=True)
@@ -104,10 +111,75 @@ class SupervisorLaunchTest(unittest.TestCase):
         self.assertNotEqual(pid, os.getpid())
         self.assertEqual(kwargs, {
             'metrics_port': 8000, 'metrics_path': '/m', 'metrics_host': 'h',
-            'listen_host': '0.0.0.0', 'listen_port': 18400})
+            'listen_host': '0.0.0.0', 'listen_port': 18400,
+            'listen_socket': self.listen_socket})
+        self.bind_m.assert_called_once_with('0.0.0.0', 18400)
+        # The supervisor keeps no copy of the socket once the watcher has it.
+        self.listen_socket.close.assert_called_once()
         # The log dir is derived from the same child pid the watcher targets.
         self.assertTrue(os.path.isdir(
             os.path.join(self.shm_base, f'graphsignal_log_{pid}')))
+
+    def test_listen_address_defaults_and_env(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('GRAPHSIGNAL_LISTEN_HOST', None)
+            os.environ.pop('GRAPHSIGNAL_LISTEN_PORT', None)
+            with self.assertRaises(SystemExit):
+                launch_supervised(['/bin/sh', '-c', 'exit 0'])
+            self.bind_m.assert_called_once_with('127.0.0.1', 18259)
+
+            self.bind_m.reset_mock()
+            os.environ['GRAPHSIGNAL_LISTEN_HOST'] = '0.0.0.0'
+            os.environ['GRAPHSIGNAL_LISTEN_PORT'] = '18401'
+            with self.assertRaises(SystemExit):
+                launch_supervised(['/bin/sh', '-c', 'exit 0'])
+            self.bind_m.assert_called_once_with('0.0.0.0', 18401)
+
+    def test_busy_listen_port_fails_before_the_workload_starts(self):
+        marker = os.path.join(self.shm_base, 'workload_ran')
+        self.bind_patch.stop()
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+                holder.bind(('127.0.0.1', 0))
+                holder.listen(1)
+                port = holder.getsockname()[1]
+                with patch.object(command_utils, 'LISTEN_BIND_TIMEOUT_SEC', 0.3):
+                    with self.assertRaises(SystemExit) as cm:
+                        launch_supervised(['/bin/sh', '-c', f'touch {marker}'],
+                                          listen_port=port)
+        finally:
+            self.bind_patch.start()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertFalse(os.path.exists(marker))
+        self.start_watcher_m.assert_not_called()
+
+    def test_log_dir_is_private(self):
+        with self.assertRaises(SystemExit):
+            launch_supervised(['/bin/sh', '-c', 'echo line'])
+        (log_dir,) = glob.glob(os.path.join(self.shm_base, 'graphsignal_log_*'))
+        self.assertEqual(stat.S_IMODE(os.stat(log_dir).st_mode), 0o700)
+        (segment,) = glob.glob(os.path.join(log_dir, 'log_*.jsonl'))
+        self.assertEqual(stat.S_IMODE(os.stat(segment).st_mode), 0o600)
+
+    def test_symlinked_log_dir_is_not_written_to(self):
+        elsewhere = tempfile.mkdtemp()
+        real_log_dir_for_pid = supervisor.log_dir_for_pid
+
+        def planted(pid):
+            path = real_log_dir_for_pid(pid)
+            if not os.path.lexists(path):
+                os.symlink(elsewhere, path)
+            return path
+
+        try:
+            with patch.object(supervisor, 'log_dir_for_pid', planted):
+                with self.assertRaises(SystemExit) as cm:
+                    launch_supervised(['/bin/sh', '-c', 'echo line; exit 3'])
+            # The workload still runs and its status is still mirrored.
+            self.assertEqual(cm.exception.code, 3)
+            self.assertEqual(os.listdir(elsewhere), [])
+        finally:
+            shutil.rmtree(elsewhere, ignore_errors=True)
 
     def test_capture_disabled_when_shm_base_missing(self):
         missing = os.path.join(self.shm_base, 'nonexistent')

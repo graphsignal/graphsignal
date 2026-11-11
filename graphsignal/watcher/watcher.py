@@ -3,6 +3,7 @@ import hashlib
 import importlib
 import logging
 import os
+import socket
 import time
 import threading
 import uuid
@@ -57,7 +58,9 @@ class Watcher:
             metrics_path=None,
             metrics_host=None,
             listen_host=None,
-            listen_port=None):
+            listen_port=None,
+            listen_fd=None,
+            listen_token=None):
         if debug_mode:
             logger.setLevel(logging.DEBUG)
         else:
@@ -77,6 +80,8 @@ class Watcher:
         self._metrics_host = metrics_host
         self._listen_host = str(listen_host) if listen_host is not None else DEFAULT_LISTEN_HOST
         self._listen_port = int(listen_port) if listen_port is not None else DEFAULT_LISTEN_PORT
+        self._listen_fd = int(listen_fd) if listen_fd is not None else None
+        self._listen_token = str(listen_token) if listen_token else None
 
         self._tick_timer_thread = None
         self._tick_stop_event = threading.Event()
@@ -123,8 +128,13 @@ class Watcher:
             self._collector.setup()
             logger.debug('Collector enabled (api key provided)')
 
+        listen_socket = None
+        if self._listen_fd is not None:
+            listen_socket = socket.socket(fileno=self._listen_fd)
+            self._listen_fd = None
         self._signals_endpoint = SignalsEndpoint(
-            host=self._listen_host, port=self._listen_port)
+            host=self._listen_host, port=self._listen_port,
+            sock=listen_socket, token=self._listen_token)
         self._signals_endpoint.setup()
 
         self._pid_monitor = PidMonitor(self._target_pid)

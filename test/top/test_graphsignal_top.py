@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import threading
 import unittest
@@ -7,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
 
 from graphsignal.commands import graphsignal_top as cli
-from graphsignal.top.client import SignalsClient, SignalsUnavailable
+from graphsignal.top.client import SignalsClient, SignalsUnavailable, printable
 from graphsignal.top.state import TopState
 from test.top import fixtures as fx
 from test.test_utils import free_port
@@ -169,6 +170,62 @@ class OnceTest(unittest.TestCase):
                 cli.main(['--port', '1'])
         self.assertEqual(cm.exception.code, 2)
         self.assertIn('not a terminal', err.getvalue())
+
+
+class UntrustedPayloadTest(unittest.TestCase):
+    def test_printable_replaces_control_characters(self):
+        self.assertEqual(printable('plain text'), 'plain text')
+        self.assertEqual(printable('a\x1b]0;title\x07b'), 'a\ufffd]0;title\ufffdb')
+        self.assertEqual(printable('line1\nline2\tx'), 'line1\nline2\tx')
+        self.assertEqual(printable({'k\x1b': ['v\x9b', 1, None, {'n': 'ok\r'}]}),
+                         {'k\ufffd': ['v\ufffd', 1, None, {'n': 'ok\ufffd'}]})
+
+    def test_once_never_writes_escape_sequences(self):
+        payload = fx.build_payload(1)
+        payload['errors'] = [{
+            'level': 'error', 'message': 'boom \x1b]0;TITLE\x07\x1b[2J',
+            'exception': 'Traceback\n  \x1b]52;c;ZXZpbA==\x07', 'tags': {},
+            'log_ns': payload['payload_ns']}]
+        for resource in payload['resources']:
+            resource['attributes']['process.command_line'] = 'x \x1b[31mred'
+        body = json.dumps(payload).encode('utf-8')
+        out = io.StringIO()
+        with SequenceServer([body, body]) as server:
+            rc = cli.render_once(
+                SignalsClient('127.0.0.1', server.port), TopState(), 0.01, out=out)
+        self.assertEqual(rc, 0)
+        self.assertNotIn('\x1b', out.getvalue())
+        self.assertNotIn('\x07', out.getvalue())
+        self.assertIn('boom', out.getvalue())
+
+    def test_token_sent_as_bearer(self):
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen['authorization'] = self.headers.get('Authorization')
+                body = b'{}'
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            SignalsClient('127.0.0.1', server.server_address[1], token='s3cret').fetch()
+            self.assertEqual(seen['authorization'], 'Bearer s3cret')
+            with patch.dict(os.environ, {'GRAPHSIGNAL_LISTEN_TOKEN': 'from-env'}):
+                SignalsClient('127.0.0.1', server.server_address[1]).fetch()
+            self.assertEqual(seen['authorization'], 'Bearer from-env')
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 
 if __name__ == '__main__':

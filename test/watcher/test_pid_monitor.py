@@ -4,7 +4,7 @@ import sys
 import time
 import unittest
 
-from graphsignal.watcher.pid_monitor import PidMonitor
+from graphsignal.watcher.pid_monitor import PidMonitor, redact_command_line
 
 
 class _RecordingListener:
@@ -112,6 +112,30 @@ class PidMonitorTest(unittest.TestCase):
             monitor.setup()  # must not raise
         finally:
             monitor.shutdown()
+
+
+class RedactCommandLineTest(unittest.TestCase):
+    def test_credential_flag_values_are_replaced(self):
+        self.assertEqual(
+            redact_command_line(['vllm', 'serve', 'm', '--api-key', 'sk-123', '--port', '8000']),
+            'vllm serve m --api-key [redacted] --port 8000')
+        self.assertEqual(
+            redact_command_line(['x', '--hf-token=hf_abc', '--admin_api_key=k', '-token', 't']),
+            'x --hf-token=[redacted] --admin_api_key=[redacted] -token [redacted]')
+        self.assertEqual(
+            redact_command_line(['x', '--ssl-keyfile-password', 'pw', '--secret', 's']),
+            'x --ssl-keyfile-password [redacted] --secret [redacted]')
+
+    def test_other_flags_are_left_alone(self):
+        argv = ['vllm', 'serve', 'm', '--max-tokens', '100', '--tokenizer', 'tok',
+                '--tokenizer-mode=auto', '--max-new-tokens=5', '--ssl-keyfile', 'k.pem']
+        self.assertEqual(redact_command_line(argv), ' '.join(argv))
+
+    def test_flag_without_a_value_is_left_alone(self):
+        self.assertEqual(redact_command_line(['x', '--token', '--port', '1']),
+                         'x --token --port 1')
+        self.assertEqual(redact_command_line(['x', '--token']), 'x --token')
+
 
 
 if __name__ == '__main__':

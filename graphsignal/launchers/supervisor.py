@@ -3,13 +3,15 @@ import json
 import logging
 import os
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
 from typing import List, NoReturn, Optional
 
-from graphsignal.launchers.command_utils import start_watcher
+from graphsignal.launchers.command_utils import bind_listen_socket, start_watcher
+from graphsignal.signals.routes import DEFAULT_LISTEN_HOST, DEFAULT_LISTEN_PORT
 
 logger = logging.getLogger('graphsignal')
 
@@ -32,6 +34,18 @@ _FORWARD_SIGNALS = tuple(
 
 def log_dir_for_pid(pid: int) -> str:
     return os.path.join(_SHM_BASE, f'{_LOG_DIR_PREFIX}{pid}')
+
+
+def _create_log_dir(log_dir: str) -> None:
+    try:
+        os.mkdir(log_dir, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(log_dir)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise OSError(f'{log_dir} is not a directory owned by the current user')
+    if st.st_mode & 0o077:
+        os.chmod(log_dir, 0o700)
 
 
 def _capture_enabled() -> bool:
@@ -105,7 +119,9 @@ class _SegmentWriter:
                 pass
             self._file = None
         cur = self._seq
-        self._file = open(os.path.join(self._log_dir, f'log_{cur}.jsonl'), 'ab')
+        fd = os.open(os.path.join(self._log_dir, f'log_{cur}.jsonl'),
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        self._file = os.fdopen(fd, 'ab')
         self._size = 0
         self._seq = cur + 1
         stale = cur - self._max_segments
@@ -155,6 +171,21 @@ def _drain_stream(pipe, console_fd: int, stream_name: str,
             pass
 
 
+def _open_listen_socket(listen_host: Optional[str], listen_port: Optional[int]):
+    """Bind the address the watcher will serve /signals on, or exit: the
+    profiler does not start a workload it cannot be read from."""
+    host = listen_host or os.getenv('GRAPHSIGNAL_LISTEN_HOST') or DEFAULT_LISTEN_HOST
+    port = listen_port
+    try:
+        if port is None:
+            port = int(os.getenv('GRAPHSIGNAL_LISTEN_PORT') or DEFAULT_LISTEN_PORT)
+        return bind_listen_socket(host, port)
+    except (OSError, ValueError, OverflowError) as exc:
+        print('graphsignal-run: cannot listen on %s:%s: %s' % (host, port, exc),
+              file=sys.stderr)
+        sys.exit(1)
+
+
 def _exit_like(rc: int) -> NoReturn:
     """Terminate the supervisor exactly like the target: same exit code, or
     death by the same signal (so the caller sees WIFSIGNALED, not a plain
@@ -187,6 +218,8 @@ def launch_supervised(argv: List[str], *,
     if not argv:
         print('graphsignal-run: no command specified')
         sys.exit(1)
+
+    listen_socket = _open_listen_socket(listen_host, listen_port)
 
     # Handlers are installed before spawn (closing the spawn/signal race);
     # the holder is filled in right after Popen returns.
@@ -227,9 +260,11 @@ def launch_supervised(argv: List[str], *,
     except PermissionError:
         print("graphsignal-run: permission error while launching '%s'" % argv[0])
         print("Did you mean `graphsignal-run python %s`?" % argv[0])
+        listen_socket.close()
         sys.exit(1)
     except FileNotFoundError:
         print("graphsignal-run: executable not found: %s" % argv[0])
+        listen_socket.close()
         sys.exit(1)
     holder['target'] = target
 
@@ -238,7 +273,7 @@ def launch_supervised(argv: List[str], *,
     if capture:
         log_dir = log_dir_for_pid(target.pid)
         try:
-            os.makedirs(log_dir, exist_ok=True)
+            _create_log_dir(log_dir)
             writer = _SegmentWriter(log_dir)
         except OSError:
             logger.error('Failed to create console log dir %s', log_dir, exc_info=True)
@@ -256,7 +291,9 @@ def launch_supervised(argv: List[str], *,
                   metrics_path=metrics_path,
                   metrics_host=metrics_host,
                   listen_host=listen_host,
-                  listen_port=listen_port)
+                  listen_port=listen_port,
+                  listen_socket=listen_socket)
+    listen_socket.close()
 
     rc = target.wait()
 

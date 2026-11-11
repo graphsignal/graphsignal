@@ -9,11 +9,15 @@ from typing import Dict, List, Optional
 import graphsignal
 import graphsignal.watcher
 from graphsignal.recorders.base_recorder import BaseRecorder
+from graphsignal.recorders.shm_files import is_owned_dir, read_regular_file
 from graphsignal.signals.logs import LogStore
 
 logger = logging.getLogger('graphsignal')
 
 MAX_ENTRIES_PER_DRAIN = 50
+
+# Bytes read from one segment per drain; the rest is picked up on later passes.
+MAX_BYTES_PER_DRAIN = 4 * 1024 * 1024
 
 # Must match graphsignal/launchers/supervisor.py; patched in tests.
 _SHM_BASE = '/dev/shm'
@@ -237,6 +241,8 @@ class LogRecorder(BaseRecorder):
 
     def _drain(self):
         shm_dir = self._shm_dir()
+        if not is_owned_dir(shm_dir):
+            return
         try:
             names = os.listdir(shm_dir)
         except OSError:
@@ -256,16 +262,16 @@ class LogRecorder(BaseRecorder):
             path = os.path.join(shm_dir, name)
             current_paths.add(path)
             offset = self._offsets.get(path, 0)
-            try:
-                with open(path, 'rb') as f:
-                    f.seek(offset)
-                    data = f.read()
-            except OSError:
+            data = read_regular_file(path, MAX_BYTES_PER_DRAIN, offset)
+            if data is None:
                 continue
             # Consume complete lines only; a partially written record is
             # picked up on the next pass.
             end = data.rfind(b'\n')
             if end < 0:
+                if len(data) >= MAX_BYTES_PER_DRAIN:
+                    # One record longer than a whole pass: skip past it.
+                    self._offsets[path] = offset + len(data)
                 continue
             self._offsets[path] = offset + end + 1
 
@@ -273,6 +279,8 @@ class LogRecorder(BaseRecorder):
                 try:
                     record = json.loads(raw)
                 except (ValueError, UnicodeDecodeError):
+                    continue
+                if not isinstance(record, dict):
                     continue
                 if 'dropped' in record:
                     logger.debug('Supervisor dropped %s console lines',

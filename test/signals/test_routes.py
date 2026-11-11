@@ -4,10 +4,14 @@ from graphsignal import version
 from graphsignal.signals.routes import build_payload, quantiles_from_bins
 from test.test_utils import configure_test_watcher
 import json
+import socket
+import threading
 import time
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 from prometheus_client.parser import text_string_to_metric_families
+from graphsignal.signals import routes
 from graphsignal.signals.routes import SignalsEndpoint
 from test.test_utils import configure_test_watcher, free_port
 
@@ -279,42 +283,112 @@ class SignalsEndpointTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual([r['name'] for r in payload['metrics']], ['g1'])
 
-    def test_second_endpoint_on_same_port_disabled_without_exception(self):
-        second = SignalsEndpoint(port=self.port, bind_retry_timeout=0)
-        second.setup()  # must not raise
-        try:
-            self.assertFalse(second.is_running())
-        finally:
-            second.shutdown()
+    def test_second_endpoint_on_same_port_fails(self):
+        second = SignalsEndpoint(port=self.port)
+        with self.assertRaises(OSError):
+            second.setup()
+        self.assertFalse(second.is_running())
+        second.shutdown()
 
-    def test_endpoint_binds_once_the_port_frees_up(self):
-        # The previous run's watcher releasing the port a moment after the new
-        # one starts must not cost the new run its endpoint.
-        second = SignalsEndpoint(port=self.port, bind_retry_interval=0.05,
-                                 bind_retry_timeout=5)
-        second.setup()
+    def test_serves_on_a_socket_bound_by_the_caller(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+        endpoint = SignalsEndpoint(port=port, sock=sock)
+        endpoint.setup()
         try:
-            self.assertFalse(second.is_running())
-            self.watcher.signals_endpoint().shutdown()
-            deadline = time.time() + 5
-            while not second.is_running() and time.time() < deadline:
-                time.sleep(0.05)
-            self.assertTrue(second.is_running())
             with urllib.request.urlopen(
-                    f'http://127.0.0.1:{self.port}/health', timeout=5) as resp:
+                    f'http://127.0.0.1:{port}/health', timeout=5) as resp:
                 self.assertEqual(resp.status, 200)
         finally:
-            second.shutdown()
+            endpoint.shutdown()
 
-    def test_endpoint_gives_up_after_timeout(self):
-        second = SignalsEndpoint(port=self.port, bind_retry_interval=0.05,
-                                 bind_retry_timeout=0.2)
-        second.setup()
+    def _raw_status(self, port, request):
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as conn:
+            conn.sendall(request)
+            return conn.recv(4096).split(b'\r\n', 1)[0]
+
+    def test_loopback_endpoint_rejects_foreign_host_header(self):
+        for host, expected in ((b'127.0.0.1:%d' % self.port, b'200'),
+                               (b'localhost', b'200'),
+                               (b'[::1]:%d' % self.port, b'200'),
+                               (b'evil.example', b'403'),
+                               (b'evil.example:%d' % self.port, b'403')):
+            status = self._raw_status(
+                self.port, b'GET /signals HTTP/1.1\r\nHost: ' + host + b'\r\n\r\n')
+            self.assertIn(expected, status, msg=host)
+        # No Host header at all (HTTP/1.0 clients) is served.
+        self.assertIn(b'200', self._raw_status(self.port, b'GET /health HTTP/1.0\r\n\r\n'))
+
+    def test_non_loopback_endpoint_accepts_any_host_header(self):
+        port = free_port()
+        endpoint = SignalsEndpoint(host='0.0.0.0', port=port)
+        endpoint.setup()
         try:
-            time.sleep(0.5)
-            self.assertFalse(second.is_running())
+            status = self._raw_status(
+                port, b'GET /health HTTP/1.1\r\nHost: gpu-box:%d\r\n\r\n' % port)
+            self.assertIn(b'200', status)
         finally:
-            second.shutdown()
+            endpoint.shutdown()
+
+    def test_token_required_when_configured(self):
+        port = free_port()
+        endpoint = SignalsEndpoint(port=port, token='s3cret')
+        endpoint.setup()
+        try:
+            for path in ('/signals', '/metrics'):
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=5)
+                self.assertEqual(cm.exception.code, 401)
+                wrong = urllib.request.Request(
+                    f'http://127.0.0.1:{port}{path}',
+                    headers={'Authorization': 'Bearer nope'})
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(wrong, timeout=5)
+                self.assertEqual(cm.exception.code, 401)
+                right = urllib.request.Request(
+                    f'http://127.0.0.1:{port}{path}',
+                    headers={'Authorization': 'Bearer s3cret'})
+                with urllib.request.urlopen(right, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+            # /health carries no data and stays open.
+            with urllib.request.urlopen(
+                    f'http://127.0.0.1:{port}/health', timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+        finally:
+            endpoint.shutdown()
+
+    def test_idle_connections_are_capped_and_time_out(self):
+        port = free_port()
+        endpoint = SignalsEndpoint(port=port)
+        idle = []
+        with patch.object(routes._SignalsServer, 'MAX_CONNECTIONS', 4), \
+                patch.object(routes._SignalsRequestHandler, 'timeout', 0.5):
+            endpoint.setup()
+            try:
+                before = threading.active_count()
+                for _ in range(20):
+                    conn = socket.create_connection(('127.0.0.1', port), timeout=5)
+                    conn.sendall(b'GET /sig')
+                    idle.append(conn)
+                time.sleep(0.2)
+                self.assertLessEqual(threading.active_count() - before, 4)
+                # Once the idle connections time out the endpoint serves again.
+                deadline = time.time() + 5
+                status = None
+                while time.time() < deadline:
+                    try:
+                        with urllib.request.urlopen(
+                                f'http://127.0.0.1:{port}/health', timeout=2) as resp:
+                            status = resp.status
+                            break
+                    except OSError:
+                        time.sleep(0.1)
+                self.assertEqual(status, 200)
+            finally:
+                for conn in idle:
+                    conn.close()
+                endpoint.shutdown()
 
 
 if __name__ == '__main__':
