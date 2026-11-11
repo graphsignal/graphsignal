@@ -186,6 +186,7 @@ class Watcher:
             ('graphsignal.recorders.host_recorder', 'HostRecorder', {}),
             ('graphsignal.recorders.nvml_recorder', 'NVMLRecorder', {}),
             ('graphsignal.recorders.amdsmi_recorder', 'AmdSmiRecorder', {}),
+            ('graphsignal.recorders.nic_recorder', 'NicRecorder', {}),
         ]
         if self._metrics_port is not None:
             specs.append((

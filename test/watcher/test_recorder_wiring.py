@@ -30,7 +30,7 @@ class RecorderWiringTest(unittest.TestCase):
         self.watcher.on_target_created(['python', 'app.py'])
         names = self._recorder_names()
         self.assertTrue({'HostRecorder', 'NVMLRecorder', 'AmdSmiRecorder',
-                         'ProcessRecorder', 'ShmRecorder'} <= names, names)
+                         'NicRecorder', 'ProcessRecorder', 'ShmRecorder'} <= names, names)
 
     def test_failing_import_does_not_block_the_others(self):
         import importlib
