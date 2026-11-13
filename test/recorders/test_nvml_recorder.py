@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import pytest
 
@@ -14,6 +15,19 @@ def has_nvidia_gpu() -> bool:
         device_count = pynvml.nvmlDeviceGetCount()
         pynvml.nvmlShutdown()
         return device_count > 0
+    except Exception:
+        return False
+
+
+def has_energy_counter() -> bool:
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return pynvml.nvmlDeviceGetTotalEnergyConsumption(handle) > 0
+        finally:
+            pynvml.nvmlShutdown()
     except Exception:
         return False
 
@@ -79,6 +93,12 @@ class NVMLRecorderTest(unittest.TestCase):
         self.assertTrue(emitted & set(expected_gauges),
                         f'no expected gpu gauges among {sorted(emitted)}')
 
+        if has_energy_counter():
+            energy = find_metric(exported, 'gpu_energy_joules')
+            self.assertIsNotNone(energy)
+            self.assertEqual(energy.type, 'counter')
+            self.assertGreater(energy.datapoint['total'], 0)
+
         resources = self.watcher.resource_store().export()
         device_resources = [r for r in resources if r['kind'] == 'device']
         self.assertGreaterEqual(len(device_resources), 1)
@@ -86,6 +106,44 @@ class NVMLRecorderTest(unittest.TestCase):
         self.assertIn('device.name', attrs)
         self.assertIn('architecture', attrs)
         self.assertIn('compute_capability', attrs)
+
+    def test_energy_emitted_as_joules_total_counter(self):
+        if not has_nvidia_gpu():
+            self.skipTest("No NVIDIA GPU available")
+
+        recorder = NVMLRecorder()
+        recorder.setup()
+
+        # NVML reports millijoules since driver load; the metric is joules,
+        # passed through as the cumulative total, never diffed.
+        with patch('graphsignal.recorders.nvml_recorder.nvmlDeviceGetTotalEnergyConsumption',
+                   return_value=1500000):
+            recorder.on_tick()
+        metric = find_metric(self.watcher.metric_store().export(), 'gpu_energy_joules')
+        self.assertIsNotNone(metric)
+        self.assertEqual(metric.type, 'counter')
+        self.assertEqual(metric.datapoint['total'], 1500.0)
+
+        with patch('graphsignal.recorders.nvml_recorder.nvmlDeviceGetTotalEnergyConsumption',
+                   return_value=2500000):
+            recorder.on_tick()
+        metric = find_metric(self.watcher.metric_store().export(), 'gpu_energy_joules')
+        self.assertEqual(metric.datapoint['total'], 2500.0)
+        recorder.shutdown()
+
+    def test_energy_not_emitted_when_unsupported(self):
+        if not has_nvidia_gpu():
+            self.skipTest("No NVIDIA GPU available")
+
+        recorder = NVMLRecorder()
+        recorder.setup()
+
+        with patch('graphsignal.recorders.nvml_recorder.nvmlDeviceGetTotalEnergyConsumption',
+                   side_effect=RuntimeError('not supported')):
+            recorder.on_tick()  # must not raise
+        self.assertIsNone(find_metric(self.watcher.metric_store().export(),
+                                      'gpu_energy_joules'))
+        recorder.shutdown()
 
     def test_xid_errors_emitted_as_running_total_counter(self):
         if not has_nvidia_gpu():

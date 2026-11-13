@@ -281,6 +281,14 @@ class NVMLRecorder(BaseRecorder):
             except Exception as err:
                 _log_nvml_error(err)
 
+            # nvmlDeviceGetTotalEnergyConsumption: millijoules since driver reload
+            try:
+                energy = nvmlDeviceGetTotalEnergyConsumption(handle) / 1000.0
+                if energy > 0:
+                    counter('gpu_energy_joules', energy)
+            except Exception as err:
+                _log_nvml_error(err)
+
             # nvmlDeviceGetFanSpeed
             try:
                 fan_speed = nvmlDeviceGetFanSpeed(handle)
