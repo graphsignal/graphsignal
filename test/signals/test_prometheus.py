@@ -5,7 +5,7 @@ from prometheus_client.parser import text_string_to_metric_families
 
 import graphsignal.watcher
 from graphsignal import version
-from graphsignal.recorders.prometheus_recorder import PrometheusRecorder
+from graphsignal.recorders.engine_recorder import EngineRecorder
 from graphsignal.signals.prometheus import (
     render_metrics, sanitize_label_name, sanitize_name)
 from test.test_utils import configure_test_watcher, find_metric
@@ -255,7 +255,7 @@ class RenderMetricsTest(unittest.TestCase):
         self.assertIn('inf{host_name="h1"} +Inf', text)
 
     def test_self_scrape_reproduces_values(self):
-        # The Prometheus recorder reading this endpoint gets back what the
+        # The engine recorder reading this endpoint gets back what the
         # store holds, under Prometheus names: sanitized tag keys, context
         # tags as labels, counters without `_total`.
         self.watcher.set_gauge('g1', 12.5, 1000, tags={'process.pid': '42'})
@@ -266,7 +266,7 @@ class RenderMetricsTest(unittest.TestCase):
         graphsignal.watcher.shutdown()
 
         second = configure_test_watcher()
-        PrometheusRecorder()._parse_and_emit(text)
+        EngineRecorder()._parse_and_emit(text)
         exported = second.metric_store().export()
 
         gauge = find_metric(exported, 'g1', {'process_pid': '42', 'host_name': 'h1'})

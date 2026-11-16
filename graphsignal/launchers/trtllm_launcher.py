@@ -2,7 +2,8 @@ import logging
 
 from graphsignal.launchers.base_launcher import BaseLauncher
 from graphsignal.launchers.command_utils import (
-    resolve_executable as _resolve, resolve_metrics_host, resolve_metrics_port)
+    extract_port, resolve_executable as _resolve, resolve_metrics_host,
+    resolve_metrics_port, resolve_probe_host)
 from graphsignal.launchers.supervisor import launch_supervised
 from graphsignal.profilers.cupti_profiler import CuptiProfiler
 from graphsignal.profilers.rocm_profiler import RocmProfiler
@@ -16,6 +17,8 @@ DEFAULT_SERVE_PORT = 8000
 DEFAULT_SERVE_HOST = 'localhost'
 # Separate from `/metrics`, which returns JSON iteration stats (IterationStats).
 DEFAULT_METRICS_PATH = '/prometheus/metrics'
+# Not /health_generate, which runs a 1-token chat completion per call.
+HEALTH_PATH = '/health'
 
 
 class TrtllmLauncher(BaseLauncher):
@@ -46,6 +49,12 @@ class TrtllmLauncher(BaseLauncher):
                           metrics_port=metrics_port,
                           metrics_path=DEFAULT_METRICS_PATH,
                           metrics_host=metrics_host,
+                          # The serving port, never --metrics-port.
+                          health_port=extract_port(self.args, default=DEFAULT_SERVE_PORT),
+                          health_path=HEALTH_PATH,
+                          health_host=resolve_probe_host(
+                              self.args, default=DEFAULT_SERVE_HOST),
+                          dcgm_exporter_url=self.dcgm_exporter_url,
                           listen_host=self.listen_host,
                           listen_port=self.listen_port)
 

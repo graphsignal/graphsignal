@@ -31,7 +31,8 @@ class TrtllmLaunchTest(unittest.TestCase):
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', '--model', 'm', '--port', '8000'],
             metrics_port=8000, metrics_path='/prometheus/metrics',
-            metrics_host='localhost', listen_host=None, listen_port=18302)
+            metrics_host='localhost', health_port=8000, health_path='/health',
+            health_host='localhost', dcgm_exporter_url=None, listen_host=None, listen_port=18302)
 
     def test_default_metrics_port_and_host(self):
         launcher = TrtllmLauncher(['trtllm-serve', '--model', 'm'])
@@ -40,7 +41,8 @@ class TrtllmLaunchTest(unittest.TestCase):
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', '--model', 'm'],
             metrics_port=8000, metrics_path='/prometheus/metrics',
-            metrics_host='localhost', listen_host=None, listen_port=None)
+            metrics_host='localhost', health_port=8000, health_path='/health',
+            health_host='localhost', dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_metrics_port_from_engine_args(self):
         launcher = TrtllmLauncher(['trtllm-serve', 'm', '--port', '8001'])
@@ -49,7 +51,8 @@ class TrtllmLaunchTest(unittest.TestCase):
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'm', '--port', '8001'],
             metrics_port=8001, metrics_path='/prometheus/metrics',
-            metrics_host='localhost', listen_host=None, listen_port=None)
+            metrics_host='localhost', health_port=8001, health_path='/health',
+            health_host='localhost', dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_metrics_host_from_engine_args(self):
         launcher = TrtllmLauncher(
@@ -59,7 +62,8 @@ class TrtllmLaunchTest(unittest.TestCase):
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'm', '--host', '0.0.0.0', '--port', '8001'],
             metrics_port=8001, metrics_path='/prometheus/metrics',
-            metrics_host='0.0.0.0', listen_host=None, listen_port=None)
+            metrics_host='0.0.0.0', health_port=8001, health_path='/health',
+            health_host='127.0.0.1', dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_explicit_metrics_port_overrides_engine_args(self):
         launcher = TrtllmLauncher(
@@ -69,7 +73,8 @@ class TrtllmLaunchTest(unittest.TestCase):
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'm', '--port', '8001'],
             metrics_port=9999, metrics_path='/prometheus/metrics',
-            metrics_host='localhost', listen_host=None, listen_port=None)
+            metrics_host='localhost', health_port=8001, health_path='/health',
+            health_host='localhost', dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_grpc_mode_warns(self):
         launcher = TrtllmLauncher(['trtllm-serve', 'm', '--grpc'])

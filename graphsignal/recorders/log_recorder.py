@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from typing import Dict, List, Optional
 
 import graphsignal
@@ -26,6 +27,12 @@ _LOG_DIR_PREFIX = 'graphsignal_log_'
 _SEGMENT_RE = re.compile(r'^log_(\d+)\.jsonl$')
 
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+# vLLM v1 runs the API server, engine core and workers as separate processes
+# and prefixes every console line with its process name: `(APIServer pid=12)
+# ERROR 11-15 09:26:13 [file.py:943] msg`, also `(EngineCore pid=…)`,
+# `(EngineCore_DP0 pid=…)`, `(Worker_TP1 pid=…)`. Stripped before parsing.
+_PROCESS_PREFIX_RE = re.compile(r'^\([^()\n]{1,64}? pid=\d+\) ')
 
 _TRACEBACK_MARKER = 'Traceback (most recent call last):'
 
@@ -74,6 +81,76 @@ _ERROR_LEVELS = ('error', 'critical', 'fatal')
 # belongs to an open traceback block.
 _TB_CLOSING_RE = re.compile(
     r'^[A-Za-z_][\w\.]*(?:Error|Exception|Warning|Interrupt|Exit|Fault|Timeout)\b')
+
+
+# workload_errors{class}: every extracted error entry is sorted into one class.
+# Rules are case-sensitive substrings over the message and the folded
+# exception, checked in this order — the root cause beats the layer that
+# reported it: a CUDA fault surfaced by NCCL's watchdog is `cuda_error`, an
+# out-of-memory inside a CUDA error string is `gpu_oom`.
+ERRORS_METRIC = 'workload_errors'
+ERROR_CLASSES = ('gpu_oom', 'cuda_error', 'nccl', 'engine')
+_ERROR_CLASS_RULES = (
+    ('gpu_oom', (
+        'CUDA out of memory',
+        'OutOfMemoryError',            # torch.OutOfMemoryError, torch.cuda.OutOfMemoryError
+        'CUDA error: out of memory',
+        'CUDA_ERROR_OUT_OF_MEMORY',
+        'cudaErrorMemoryAllocation',
+        'CUBLAS_STATUS_ALLOC_FAILED',
+        'HIP out of memory',
+        'hipErrorOutOfMemory',
+        # vLLM startup: weights and activations leave no room for the KV
+        # cache; the fix is a GPU memory fix.
+        'No available memory for the cache blocks',
+    )),
+    ('cuda_error', (
+        'CUDA error',
+        'cudaError',
+        'CUDA_ERROR_',
+        'illegal memory access',
+        'unspecified launch failure',
+        'device-side assert',
+        'misaligned address',
+        'illegal instruction',
+        'HIP error',
+        'hipError',
+        'CUBLAS_STATUS_',
+        'CUDNN_STATUS_',
+        'Triton Error [CUDA]',
+        'CUDA runtime error',          # TensorRT-LLM's TLLM_CUDA_CHECK
+    )),
+    ('nccl', (
+        'NCCL error',
+        'ncclInternalError',
+        'ncclSystemError',
+        'ncclUnhandledCudaError',
+        'ncclInvalidUsage',
+        'ncclInvalidArgument',
+        'ncclRemoteError',
+        'ProcessGroupNCCL',
+        'Watchdog caught collective operation timeout',
+        'DistBackendError',
+        'RCCL',
+    )),
+)
+
+
+# GPU allocator failures phrased without a fixed marker, e.g. TensorRT-LLM's
+# "CUDA runtime error in ::cudaMallocAsync(...): out of memory". One line must
+# name the GPU runtime and say "out of memory"; host OOMs never name it.
+_GPU_OOM_RE = re.compile(r'(?:CUDA|cuda|HIP|hip)[^\n]*out of memory')
+
+
+def classify_error(message: str, exception: str = '') -> str:
+    """Sort one extracted error entry into an ERROR_CLASSES class."""
+    text = f'{message or ""}\n{exception or ""}'
+    if _GPU_OOM_RE.search(text):
+        return 'gpu_oom'
+    for error_class, markers in _ERROR_CLASS_RULES:
+        if any(marker in text for marker in markers):
+            return error_class
+    return 'engine'
 
 
 class _ParsedLine:
@@ -134,6 +211,7 @@ class _StreamExtractor:
     def feed(self, ts_ns: int, line: str) -> List[dict]:
         out = []
         line = _ANSI_RE.sub('', line.rstrip('\r\n'))
+        line = _PROCESS_PREFIX_RE.sub('', line, count=1)
         if not line.strip():
             return out
         parsed = _parse_line(line)
@@ -204,6 +282,10 @@ class LogRecorder(BaseRecorder):
         self._disabled = True
         self._offsets: Dict[str, int] = {}
         self._extractors: Dict[str, _StreamExtractor] = {}
+        # Error entries extracted since the watcher started, per class. Counted
+        # before the per-drain entry cap, so totals stay exact when the log
+        # store drops entries.
+        self._error_totals: Dict[str, int] = {c: 0 for c in ERROR_CLASSES}
 
     def _shm_dir(self) -> str:
         # Written by the graphsignal-run supervisor; own prefix so the
@@ -226,12 +308,14 @@ class LogRecorder(BaseRecorder):
         if self._disabled:
             return
         self._drain()
+        self._emit_error_totals()
 
     def finalize(self):
         if self._disabled:
             return
         self._drain()
         self._flush_extractors()
+        self._emit_error_totals()
 
     def shutdown(self):
         if self._disabled:
@@ -305,6 +389,7 @@ class LogRecorder(BaseRecorder):
                 stream = record.get('stream', '')
                 extractor = self._extractors.setdefault(stream, _StreamExtractor())
                 for entry in extractor.feed(record.get('ts'), line):
+                    self._count_error(entry)
                     if emitted < MAX_ENTRIES_PER_DRAIN:
                         self._record_entry(entry, stream)
                         emitted += 1
@@ -321,7 +406,31 @@ class LogRecorder(BaseRecorder):
     def _flush_extractors(self):
         for stream, extractor in self._extractors.items():
             for entry in extractor.flush():
+                self._count_error(entry)
                 self._record_entry(entry, stream)
+
+    def _count_error(self, entry: dict) -> None:
+        # Supervisor exit-status records never reach here: each crash already
+        # printed its own error line, and counting the exit too would count
+        # it twice.
+        error_class = classify_error(entry.get('message', ''),
+                                     entry.get('exception', ''))
+        self._error_totals[error_class] += 1
+
+    def _emit_error_totals(self) -> None:
+        # All classes are published, zeros included: 0 means watched and none
+        # seen; an absent metric means the console was not watched.
+        try:
+            if not graphsignal.watcher.is_configured():
+                return
+            watcher = graphsignal.watcher.watcher()
+            now_ns = time.time_ns()
+            for error_class, total in self._error_totals.items():
+                watcher.set_counter(name=ERRORS_METRIC, total=total,
+                                    measurement_ts=now_ns,
+                                    tags={'class': error_class})
+        except Exception:
+            logger.error('Failed to record error counters', exc_info=True)
 
     def _record_entry(self, entry: dict, stream: str) -> None:
         try:

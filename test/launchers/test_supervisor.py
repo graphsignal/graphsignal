@@ -103,14 +103,18 @@ class SupervisorLaunchTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             launch_supervised(['/bin/sh', '-c', 'exit 0'],
                               metrics_port=8000, metrics_path='/m',
-                              metrics_host='h', listen_host='0.0.0.0',
-                              listen_port=18400)
+                              metrics_host='h', health_port=8001,
+                              health_path='/ready', health_host='hh',
+                              dcgm_exporter_url='http://n:9400/metrics',
+                              listen_host='0.0.0.0', listen_port=18400)
 
         self.start_watcher_m.assert_called_once()
         (pid,), kwargs = self.start_watcher_m.call_args
         self.assertNotEqual(pid, os.getpid())
         self.assertEqual(kwargs, {
             'metrics_port': 8000, 'metrics_path': '/m', 'metrics_host': 'h',
+            'health_port': 8001, 'health_path': '/ready', 'health_host': 'hh',
+            'dcgm_exporter_url': 'http://n:9400/metrics',
             'listen_host': '0.0.0.0', 'listen_port': 18400,
             'listen_socket': self.listen_socket})
         self.bind_m.assert_called_once_with('0.0.0.0', 18400)

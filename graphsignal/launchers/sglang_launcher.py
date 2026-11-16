@@ -3,7 +3,8 @@ import os
 
 from graphsignal.launchers.base_launcher import BaseLauncher
 from graphsignal.launchers.command_utils import (
-    resolve_executable as _resolve, resolve_metrics_port)
+    extract_port, resolve_executable as _resolve, resolve_metrics_port,
+    resolve_probe_host)
 from graphsignal.launchers.supervisor import launch_supervised
 from graphsignal.profilers.cupti_profiler import CuptiProfiler
 from graphsignal.profilers.rocm_profiler import RocmProfiler
@@ -14,6 +15,12 @@ _SGLANG_NAMES = {'sglang', 'sglang.launch_server'}
 
 # SGLang serves Prometheus /metrics on its HTTP server (--port, default 30000).
 DEFAULT_SERVE_PORT = 30000
+# Not /health: in SGLang /health (= /health_generate) submits a 1-token
+# generation per call by default. /ready reads flags only, and turns 200 once
+# SGLang's own startup warmup succeeds (503 while paused, e.g. a weight sync).
+# Releases without /ready (0.5.10 has none) answer 404; the probe then falls
+# back to /ping, which only says the HTTP server is up.
+HEALTH_PATH = '/ready,/ping'
 
 
 class SglangLauncher(BaseLauncher):
@@ -44,6 +51,11 @@ class SglangLauncher(BaseLauncher):
         logger.debug('SglangLauncher launch: %s %s', executable, new_args)
         launch_supervised([executable] + new_args[1:],
                           metrics_port=metrics_port,
+                          # The serving port, never --metrics-port.
+                          health_port=extract_port(self.args, default=DEFAULT_SERVE_PORT),
+                          health_path=HEALTH_PATH,
+                          health_host=resolve_probe_host(self.args),
+                          dcgm_exporter_url=self.dcgm_exporter_url,
                           listen_host=self.listen_host,
                           listen_port=self.listen_port)
 

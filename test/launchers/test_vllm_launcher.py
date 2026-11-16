@@ -39,7 +39,9 @@ class VllmLaunchTest(unittest.TestCase):
         # No --port in argv → falls back to vLLM's default serving port (8000).
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'serve', 'm'],
-            metrics_port=8000, listen_host=None, listen_port=18300)
+            metrics_port=8000,
+            health_port=8000, health_path='/health', health_host='127.0.0.1',
+            dcgm_exporter_url=None, listen_host=None, listen_port=18300)
 
     def test_launch_passes_argv_unchanged_except_disable_log_stats(self):
         launcher = VllmLauncher(
@@ -49,7 +51,9 @@ class VllmLaunchTest(unittest.TestCase):
 
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'serve', 'm', '--dtype', 'auto'],
-            metrics_port=8000, listen_host=None, listen_port=None)
+            metrics_port=8000,
+            health_port=8000, health_path='/health', health_host='127.0.0.1',
+            dcgm_exporter_url=None, listen_host=None, listen_port=None)
         self.assertNotIn('--disable-log-stats', fx.launched_argv)
         self.assertNotIn('--otlp-traces-endpoint', fx.launched_argv)
 
@@ -59,7 +63,9 @@ class VllmLaunchTest(unittest.TestCase):
             launcher.launch()
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'serve', 'm', '--port', '8001'],
-            metrics_port=8001, listen_host=None, listen_port=None)
+            metrics_port=8001,
+            health_port=8001, health_path='/health', health_host='127.0.0.1',
+            dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_launch_explicit_metrics_port_overrides_engine_args(self):
         launcher = VllmLauncher(
@@ -68,7 +74,27 @@ class VllmLaunchTest(unittest.TestCase):
             launcher.launch()
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'serve', 'm', '--port', '8001'],
-            metrics_port=9999, listen_host=None, listen_port=None)
+            metrics_port=9999,
+            health_port=8001, health_path='/health', health_host='127.0.0.1',
+            dcgm_exporter_url=None, listen_host=None, listen_port=None)
+
+    def test_launch_health_host_from_engine_host(self):
+        launcher = VllmLauncher(
+            ['vllm', 'serve', 'm', '--host', '10.0.0.5', '--port', '8001'])
+        with LaunchFixture(vllm_mod) as fx:
+            launcher.launch()
+        kwargs = fx.launch_supervised_m.call_args[1]
+        self.assertEqual(
+            (kwargs['health_host'], kwargs['health_port'], kwargs['health_path']),
+            ('10.0.0.5', 8001, '/health'))
+
+    def test_launch_passes_dcgm_exporter_url(self):
+        launcher = VllmLauncher(['vllm', 'serve', 'm'],
+                                dcgm_exporter_url='http://10.0.0.7:9400/metrics')
+        with LaunchFixture(vllm_mod) as fx:
+            launcher.launch()
+        self.assertEqual(fx.launch_supervised_m.call_args[1]['dcgm_exporter_url'],
+                         'http://10.0.0.7:9400/metrics')
 
     def test_launch_raises_when_executable_missing(self):
         launcher = VllmLauncher(['vllm-typo'])

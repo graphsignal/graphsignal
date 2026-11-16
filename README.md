@@ -69,9 +69,12 @@ Options (before the command):
 | `--listen-host HOST` | Host to bind the `/signals` and `/metrics` endpoint to (default: `127.0.0.1`). Set e.g. `0.0.0.0` to expose it for remote access — anything on that network can then read it. Set `GRAPHSIGNAL_LISTEN_TOKEN` in the environment of `graphsignal-run` to require `Authorization: Bearer <token>` on `/signals` and `/metrics` (`401` without it; `/health` stays open); `graphsignal-top` reads the same variable. The endpoint is plain HTTP, so the token is not encrypted in transit. |
 | `--listen-port PORT` | Port for the `/signals` and `/metrics` endpoint (default: `18259`). If the port is busy, `graphsignal-run` exits with an error instead of starting the workload. |
 | `--cuda-graph-trace {graph\|node}` | Granularity for CUDA graph launches (default: `graph`). `graph` times each replay as a whole into `cuda_graphs_nanoseconds`; `node` times the kernels inside the graph individually into `cuda_kernels_nanoseconds`. Also settable via `GRAPHSIGNAL_CUDA_GRAPH_TRACE`; the flag wins. |
+| `--dcgm-exporter URL` | Full URL of a node-local NVIDIA dcgm-exporter metrics endpoint (e.g. `http://<node-ip>:9400/metrics`). Imports its `DCGM_FI_PROF_*` profiling metrics (SM, tensor-pipe and DRAM activity, PCIe and NVLink rates) for this workload's GPUs. Off unless given; the profiler never looks for an exporter on its own. Use the exporter on the workload's own node, not a cluster Service, which can route to another node's exporter. |
 | `--rocm-kernel-trace {none\|all}` | Per-kernel tracing on ROCm (default: `none`). `all` times every kernel dispatch into `rocm_kernels_nanoseconds`. rocprofiler-sdk charges tens of microseconds per dispatch for it, so this is an investigation mode, not for production (see [Overhead](#overhead)). Also settable via `GRAPHSIGNAL_ROCM_KERNEL_TRACE`; the flag wins. |
 
 Engine notes: the SGLang launcher adds `--enable-metrics` so the Prometheus endpoint is available; the vLLM launcher removes `--disable-log-stats` for the same reason. Everything else on the command line is passed through unchanged.
+
+For vLLM, SGLang and TensorRT-LLM the profiler also probes the engine's health endpoint every 5 seconds on its serving port, and reports startup, uptime and downtime. It uses an endpoint that does no inference: `/health` on vLLM and TensorRT-LLM, and `/ready` on SGLang, whose `/health` runs a one-token generation by default. SGLang releases without `/ready` (0.5.10 and earlier) get `/ping` instead, which only shows that the HTTP server is up. On vLLM each probe writes one access-log line; add `--disable-access-log-for-endpoints /health` to the vLLM command to silence them.
 
 
 ## Optimization loop
@@ -229,7 +232,7 @@ GPU activity is collected with low-overhead CUPTI/ROCm activity APIs inside the 
 
 Three collection modes, in the order you should reach for them:
 
-* **Kernels** (default) — just `graphsignal-run`. Cheap enough to leave on, including in production.
+* **Kernels** (default) — just `graphsignal-run`. Cheap enough to leave on, including in production. Overhead can be higher on small, launch-bound models.
 * **Graph node trace** — `--cuda-graph-trace node`, when the default mode puts all the GPU time in `cuda_graphs_nanoseconds` and you need it per kernel. Run it for the investigation, then go back to the default.
 * **ROCm kernel trace** — `--rocm-kernel-trace all`, the ROCm counterpart: by default the ROCm library collects transfers, synchronization, device telemetry and engine metrics but no per-kernel time, because rocprofiler-sdk intercepts the completion of every traced dispatch at tens of microseconds each, graph-replayed or not (measured ~50 µs on an MI300X VF, 6 → 27 ms per decode token on a small model). Switch it on to rank kernels, read the profile, switch it off. Not for production.
 * **GPU probes** — instrument the code with [probe.h](include/graphsignal/probe.h), once a kernel is named and the question is which part of it. Safe to leave in production; cost follows how densely you record.

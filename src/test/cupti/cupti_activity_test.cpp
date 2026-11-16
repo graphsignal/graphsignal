@@ -571,12 +571,219 @@ static void run_capture_child() {
   ASSERT_EQ(WEXITSTATUS(status), 0, "capture child must exit 0");
 }
 
+// ---------------------------------------------------------------------------
+// Device time: cuda_device_busy_nanoseconds (union of kernel/graph intervals),
+// cuda_device_kernel_nanoseconds (their sum) and cuda_device_idle_gap_nanoseconds
+// (gaps between busy periods), tagged device.uuid. Re-exec'd child: CUPTI
+// starts BEFORE the CUDA context exists, as it does under injection, so the
+// context-created callback resolves the UUID.
+// ---------------------------------------------------------------------------
+
+static const char* kDeviceTimeMarker = "--device-time-scenario";
+
+struct DeviceTimeReading {
+  uint64_t busy = 0;
+  uint64_t kernel = 0;
+  uint64_t gap_count = 0;
+  uint64_t gap_sum = 0;
+  std::string tags;
+};
+
+// Reads the three device-time metrics for the single device in this process.
+static DeviceTimeReading read_device_time() {
+  // Several writer intervals; every write force-flushes CUPTI first.
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+  const std::string json = read_file(shm_json_path());
+  ASSERT(!json.empty(), "cupti.json should exist in the device-time child");
+  const auto busy = find_metric_blocks(json, "cuda_device_busy_nanoseconds");
+  const auto kernel = find_metric_blocks(json, "cuda_device_kernel_nanoseconds");
+  const auto gaps = find_metric_blocks(json, "cuda_device_idle_gap_nanoseconds");
+  ASSERT_EQ(busy.size(), static_cast<size_t>(1), "one busy counter per device");
+  ASSERT_EQ(kernel.size(), static_cast<size_t>(1), "one kernel counter per device");
+  ASSERT_EQ(gaps.size(), static_cast<size_t>(1), "one idle-gap histogram per device");
+  ASSERT(busy[0].find("\"type\":\"counter\"") != std::string::npos,
+         "busy time must serialize as a counter");
+  ASSERT(gaps[0].find("\"type\":\"histogram\"") != std::string::npos,
+         "idle gaps must serialize as a histogram");
+  DeviceTimeReading r;
+  r.busy = block_u64(busy[0], "value");
+  r.kernel = block_u64(kernel[0], "value");
+  r.gap_count = counts_total(gaps[0]);
+  r.gap_sum = block_u64(gaps[0], "sum");
+  const size_t t = busy[0].find("\"tags\":{");
+  r.tags = t == std::string::npos ? std::string()
+                                  : busy[0].substr(t, busy[0].find('}', t) - t + 1);
+  std::printf("device time: busy=%llu kernel=%llu gaps=%llu gap_sum=%llu tags=%s\n",
+              static_cast<unsigned long long>(r.busy),
+              static_cast<unsigned long long>(r.kernel),
+              static_cast<unsigned long long>(r.gap_count),
+              static_cast<unsigned long long>(r.gap_sum), r.tags.c_str());
+  return r;
+}
+
+// nvidia-smi's UUID for the GPU at this PCI bus id; "" when nvidia-smi is
+// unavailable.
+static std::string nvidia_smi_uuid(const char* pci_bus_id) {
+  char cmd[256];
+  std::snprintf(cmd, sizeof(cmd),
+                "nvidia-smi --query-gpu=uuid --format=csv,noheader -i %s 2>/dev/null",
+                pci_bus_id);
+  FILE* p = popen(cmd, "r");
+  if (!p) return std::string();
+  char buf[128] = {0};
+  std::string out;
+  if (std::fgets(buf, sizeof(buf), p)) out = buf;
+  pclose(p);
+  while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back()))) out.pop_back();
+  return out.rfind("GPU-", 0) == 0 ? out : std::string();
+}
+
+static int device_time_scenario() {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    std::printf("device-time child: CUDA not available, skipping\n");
+    return 0;
+  }
+  // CUPTI first, then the context.
+  ASSERT(cupti_activity_start(100'000'000ULL, /*debug_mode=*/1,
+                              GRAPHSIGNAL_GRAPH_TRACE_MODE_GRAPH) == 1,
+         "cupti_activity_start failed in device-time child");
+  ASSERT(cudaSetDevice(0) == cudaSuccess, "cudaSetDevice failed");
+
+  const unsigned long long kCycles = 50'000'000ULL;  // tens of ms per launch
+  int* d_sink = nullptr;
+  ASSERT(cudaMalloc(&d_sink, sizeof(int)) == cudaSuccess, "cudaMalloc(d_sink) failed");
+  cudaStream_t s1 = nullptr, s2 = nullptr;
+  ASSERT(cudaStreamCreate(&s1) == cudaSuccess, "stream 1 create failed");
+  ASSERT(cudaStreamCreate(&s2) == cudaSuccess, "stream 2 create failed");
+
+  // Warm-up: module loading and the first launch's overheads stay out of the
+  // measured phases.
+  busy_wait_kernel_A<<<1, 32, 0, s1>>>(d_sink, 1000);
+  busy_wait_kernel_B<<<1, 32, 0, s2>>>(d_sink, 1000);
+  ASSERT(cudaDeviceSynchronize() == cudaSuccess, "warm-up sync failed");
+  const DeviceTimeReading r0 = read_device_time();
+
+  // --- UUID tag, as NVML prints it.
+  char pci[32] = {0};
+  ASSERT(cudaDeviceGetPCIBusId(pci, sizeof(pci), 0) == cudaSuccess, "PCI bus id failed");
+  const std::string expected_uuid = nvidia_smi_uuid(pci);
+  ASSERT(r0.tags.find("\"device.uuid\":\"GPU-") != std::string::npos,
+         "device time must be tagged device.uuid when CUPTI starts before the context");
+  if (!expected_uuid.empty()) {
+    std::printf("device-time child: nvidia-smi uuid=%s\n", expected_uuid.c_str());
+    ASSERT(r0.tags.find(expected_uuid) != std::string::npos,
+           "device.uuid must equal nvidia-smi's UUID for the device");
+  } else {
+    std::printf("device-time child: nvidia-smi unavailable, UUID not compared\n");
+  }
+
+  // --- Phase 1: two single-block kernels on two streams run side by side:
+  // kernel time ~ 2x busy time.
+  for (int i = 0; i < 3; ++i) {
+    busy_wait_kernel_A<<<1, 32, 0, s1>>>(d_sink, kCycles);
+    busy_wait_kernel_B<<<1, 32, 0, s2>>>(d_sink, kCycles);
+    ASSERT(cudaDeviceSynchronize() == cudaSuccess, "overlap sync failed");
+  }
+  const DeviceTimeReading r1 = read_device_time();
+  const double busy1 = static_cast<double>(r1.busy - r0.busy);
+  const double kernel1 = static_cast<double>(r1.kernel - r0.kernel);
+  std::printf("device-time child: overlap phase kernel/busy=%.3f\n", kernel1 / busy1);
+  ASSERT(busy1 > 0, "overlap phase must add busy time");
+  ASSERT(kernel1 / busy1 > 1.6 && kernel1 / busy1 <= 2.0001,
+         "two overlapping streams: kernel time must be ~2x busy time");
+
+  // --- Phase 2: one stream, a host sleep between launches: every launch after
+  // the first opens a new busy period behind a gap of at least the sleep, and
+  // nothing overlaps.
+  const int kGapLaunches = 5;
+  const auto kSleep = std::chrono::milliseconds(20);
+  for (int i = 0; i < kGapLaunches; ++i) {
+    busy_wait_kernel_A<<<1, 32, 0, s1>>>(d_sink, kCycles / 10);
+    ASSERT(cudaStreamSynchronize(s1) == cudaSuccess, "gap-phase sync failed");
+    std::this_thread::sleep_for(kSleep);
+  }
+  const DeviceTimeReading r2 = read_device_time();
+  const uint64_t gaps2 = r2.gap_count - r1.gap_count;
+  const uint64_t gap_sum2 = r2.gap_sum - r1.gap_sum;
+  ASSERT(gaps2 >= static_cast<uint64_t>(kGapLaunches),
+         "every launch after an idle sleep must record a gap");
+  ASSERT(gap_sum2 >= static_cast<uint64_t>(kGapLaunches - 1) * 15'000'000ULL,
+         "the gaps must cover the host sleeps");
+  ASSERT_EQ(r2.busy - r1.busy, r2.kernel - r1.kernel,
+            "without overlap, busy time must equal kernel time");
+
+  // --- Phase 3: a captured graph replayed in graph mode is one interval per
+  // replay, the same interval cuda_graphs_nanoseconds times.
+  {
+    const std::string before = read_file(shm_json_path());
+    const auto gb = find_metric_blocks(before, "cuda_graphs_nanoseconds");
+    uint64_t graph_before = 0;
+    for (const auto& f : gb.empty() ? std::vector<Frame>() : parse_frames(gb[0])) {
+      graph_before += f.value;
+    }
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT(cudaStreamBeginCapture(s1, cudaStreamCaptureModeGlobal) == cudaSuccess,
+           "begin capture failed");
+    busy_wait_kernel_A<<<1, 32, 0, s1>>>(d_sink, kCycles / 10);
+    busy_wait_kernel_B<<<1, 32, 0, s1>>>(d_sink, kCycles / 10);
+    ASSERT(cudaStreamEndCapture(s1, &graph) == cudaSuccess, "end capture failed");
+    ASSERT(cudaGraphInstantiate(&graph_exec, graph, 0) == cudaSuccess,
+           "instantiate failed");
+    for (int i = 0; i < 3; ++i) {
+      ASSERT(cudaGraphLaunch(graph_exec, s1) == cudaSuccess, "graph launch failed");
+      ASSERT(cudaStreamSynchronize(s1) == cudaSuccess, "graph sync failed");
+      std::this_thread::sleep_for(kSleep);
+    }
+    const DeviceTimeReading r3 = read_device_time();
+    const std::string after = read_file(shm_json_path());
+    const auto ga = find_metric_blocks(after, "cuda_graphs_nanoseconds");
+    ASSERT(!ga.empty(), "graph profile missing");
+    uint64_t graph_after = 0;
+    for (const auto& f : parse_frames(ga[0])) graph_after += f.value;
+    ASSERT_EQ(r3.kernel - r2.kernel, graph_after - graph_before,
+              "graph mode: kernel time must equal the graph replay time");
+    ASSERT(r3.gap_count - r2.gap_count >= 3ull,
+           "graph mode: each replay after a sleep must record a gap");
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+  }
+
+  cudaStreamDestroy(s1);
+  cudaStreamDestroy(s2);
+  cudaFree(d_sink);
+  cupti_activity_stop();
+  std::printf("device-time child passed\n");
+  return 0;
+}
+
+static void run_device_time_child() {
+  std::printf("--- device-time child: busy time, kernel time, idle gaps\n");
+  pid_t pid = fork();
+  ASSERT(pid >= 0, "fork must succeed");
+  if (pid == 0) {
+    char arg0[] = "cupti_activity_test";
+    char arg1[] = "--device-time-scenario";
+    char* const child_argv[] = {arg0, arg1, nullptr};
+    execv("/proc/self/exe", child_argv);
+    _exit(127);
+  }
+  int status = 0;
+  ASSERT(waitpid(pid, &status, 0) == pid, "waitpid must return the child");
+  ASSERT(WIFEXITED(status), "device-time child must exit normally");
+  ASSERT_EQ(WEXITSTATUS(status), 0, "device-time child must exit 0");
+}
+
 int main(int argc, char** argv) {
   if (argc > 1 && std::strcmp(argv[1], kGraphTraceMarker) == 0) {
     return graph_trace_scenario();
   }
   if (argc > 1 && std::strcmp(argv[1], kCaptureMarker) == 0) {
     return capture_scenario();
+  }
+  if (argc > 1 && std::strcmp(argv[1], kDeviceTimeMarker) == 0) {
+    return device_time_scenario();
   }
 
   int device_count = 0;
@@ -597,6 +804,9 @@ int main(int argc, char** argv) {
 
   // Device probes must never break a workload's CUDA graph capture.
   run_capture_child();
+
+  // Busy time, kernel time and idle gaps per device.
+  run_device_time_child();
 
   // HOST-storage probe, registered before profiling starts. The writer reads
   // the registry on every serialize, so it appears in cupti.json.

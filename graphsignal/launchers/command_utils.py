@@ -100,10 +100,32 @@ def resolve_metrics_host(metrics_host: Optional[str], args: List[str],
     return extract_host(args, default=default)
 
 
+# Wildcard bind addresses an engine may listen on; a probe from this host
+# reaches them on loopback.
+_WILDCARD_HOSTS = frozenset({'', '0.0.0.0', '::', '[::]'})
+
+
+def resolve_probe_host(args: List[str], default: str = '127.0.0.1') -> str:
+    """Pick the host to send a health probe to: the engine's ``--host``;
+    ``default`` (the engine's own default bind host) when absent; IPv4
+    loopback for a wildcard bind, which accepts it on any address — not
+    ``localhost``, which may resolve to ``::1`` first."""
+    host = extract_host(args, default=None)
+    if host is None:
+        return default
+    if host.strip() in _WILDCARD_HOSTS:
+        return '127.0.0.1'
+    return host
+
+
 def start_watcher(pid: int,
                   metrics_port: Optional[int] = None,
                   metrics_path: Optional[str] = None,
                   metrics_host: Optional[str] = None,
+                  health_port: Optional[int] = None,
+                  health_path: Optional[str] = None,
+                  health_host: Optional[str] = None,
+                  dcgm_exporter_url: Optional[str] = None,
                   listen_host: Optional[str] = None,
                   listen_port: Optional[int] = None,
                   listen_socket: Optional[socket.socket] = None) -> Optional[subprocess.Popen]:
@@ -122,6 +144,14 @@ def start_watcher(pid: int,
         cmd.extend(['--metrics-path', str(metrics_path)])
     if metrics_host is not None:
         cmd.extend(['--metrics-host', str(metrics_host)])
+    if health_port is not None:
+        cmd.extend(['--health-port', str(int(health_port))])
+    if health_path is not None:
+        cmd.extend(['--health-path', str(health_path)])
+    if health_host is not None:
+        cmd.extend(['--health-host', str(health_host)])
+    if dcgm_exporter_url is not None:
+        cmd.extend(['--dcgm-exporter', str(dcgm_exporter_url)])
     if listen_host is not None:
         cmd.extend(['--listen-host', str(listen_host)])
     if listen_port is not None:

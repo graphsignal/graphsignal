@@ -27,7 +27,13 @@ logger = logging.getLogger('graphsignal')
 # NVML's own cumulative totals. Nothing is diffed or derived here — rates and
 # utilization ratios are computed by whoever reads consecutive snapshots.
 
-MAX_NVLINK_LINKS = 6
+# Every link id NVML can answer for: 18 on GB200/GB300; the enumeration stops
+# at the first id NVML rejects.
+MAX_NVLINK_LINKS = globals().get('NVML_NVLINK_MAX_LINKS', 18)
+
+# scopeId selecting the sum over all links for the NVLink throughput fields
+# (per link otherwise: the scopeId is the link id).
+NVLINK_ALL_LINKS_SCOPE = 0xFFFFFFFF
 
 
 class NVMLRecorder(BaseRecorder):
@@ -360,58 +366,14 @@ class NVMLRecorder(BaseRecorder):
             except Exception as err:
                 _log_nvml_error(err)
 
-            # NVML_FI_DEV_NVLINK_THROUGHPUT_*: cumulative KiB totals.
-            for field_id, name in [
-                (NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX, 'gpu_nvlink_throughput_data_tx_kibibytes'),
-                (NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX, 'gpu_nvlink_throughput_data_rx_kibibytes'),
-                (NVML_FI_DEV_NVLINK_THROUGHPUT_RAW_TX, 'gpu_nvlink_throughput_raw_tx_kibibytes'),
-                (NVML_FI_DEV_NVLINK_THROUGHPUT_RAW_RX, 'gpu_nvlink_throughput_raw_rx_kibibytes'),
-            ]:
-                try:
-                    field_value = nvmlDeviceGetFieldValues(handle, [field_id])[0]
-                    if field_value.nvmlReturn == NVML_SUCCESS:
-                        value = _nvml_value(field_value.valueType, field_value.value)
-                        if value is not None and value > 0:
-                            counter(name, value)
-                except Exception as err:
-                    _log_nvml_error(err)
+            # NVLink: link state and error counters, all-link and per-link
+            # throughput, link speed.
+            def link_counter(name, total, link):
+                watcher.set_counter(
+                    name=name, total=total, measurement_ts=now_ns,
+                    tags=dict(device_tags, **{'nvlink.link': str(link)}))
 
-            # nvmlDeviceGetNvLinkState / nvmlDeviceGetNvLinkErrorCounter
-            try:
-                link_count = 0
-                active_links = 0
-                error_totals = {
-                    'gpu_nvlink_errors_replay': [NVML_NVLINK_ERROR_DL_REPLAY, 0],
-                    'gpu_nvlink_errors_recovery': [NVML_NVLINK_ERROR_DL_RECOVERY, 0],
-                    'gpu_nvlink_errors_crc': [NVML_NVLINK_ERROR_DL_CRC, 0],
-                    'gpu_nvlink_errors_minor': [NVML_NVLINK_ERROR_DL_MINOR, 0],
-                    'gpu_nvlink_errors_major': [NVML_NVLINK_ERROR_DL_MAJOR, 0],
-                    'gpu_nvlink_errors_fatal': [NVML_NVLINK_ERROR_DL_FATAL, 0],
-                }
-                for link in range(MAX_NVLINK_LINKS):
-                    try:
-                        state = nvmlDeviceGetNvLinkState(handle, link)
-                    except Exception:
-                        break
-                    if not state:
-                        continue
-                    link_count += 1
-                    active_links += 1
-                    for name, entry in error_totals.items():
-                        try:
-                            entry[1] += nvmlDeviceGetNvLinkErrorCounter(handle, link, entry[0])
-                        except Exception as err:
-                            _log_nvml_error(err)
-
-                if link_count > 0:
-                    gauge('gpu_nvlink_link_count', link_count)
-                    gauge('gpu_nvlink_active_links', active_links)
-                    for name, entry in error_totals.items():
-                        if entry[1] > 0:
-                            counter(name, entry[1])
-            except Exception:
-                # NVLINK not available on this device
-                pass
+            _record_nvlink(handle, gauge, counter, link_counter)
 
             # nvmlDeviceGetTotalEccErrors (cumulative)
             for name, error_type, counter_type in [
@@ -502,6 +464,107 @@ def _avg_sample_value(sample_value_type, samples):
         return sum(sample_values) / len(sample_values)
 
     return 0.0
+
+
+def _record_nvlink(handle, gauge, counter, link_counter) -> None:
+    """NVLink state, errors, throughput and speed for one device. Emits
+    nothing on a device without NVLink."""
+    # nvmlDeviceGetNvLinkState / nvmlDeviceGetNvLinkErrorCounter
+    link_count = 0
+    active_links = []
+    # The counter types nvmlDeviceGetNvLinkErrorCounter accepts. Looked up by
+    # name so a pynvml without one drops that counter, not the whole block.
+    error_totals = {
+        name: [globals()[constant], 0]
+        for name, constant in (
+            ('gpu_nvlink_errors_replay', 'NVML_NVLINK_ERROR_DL_REPLAY'),
+            ('gpu_nvlink_errors_recovery', 'NVML_NVLINK_ERROR_DL_RECOVERY'),
+            ('gpu_nvlink_errors_crc_flit', 'NVML_NVLINK_ERROR_DL_CRC_FLIT'),
+            ('gpu_nvlink_errors_crc_data', 'NVML_NVLINK_ERROR_DL_CRC_DATA'),
+            ('gpu_nvlink_errors_ecc_data', 'NVML_NVLINK_ERROR_DL_ECC_DATA'),
+        )
+        if constant in globals()
+    }
+    for link in range(MAX_NVLINK_LINKS):
+        try:
+            state = nvmlDeviceGetNvLinkState(handle, link)
+        except Exception:
+            break
+        link_count += 1
+        if not state:
+            continue
+        active_links.append(link)
+        for entry in error_totals.values():
+            try:
+                entry[1] += nvmlDeviceGetNvLinkErrorCounter(handle, link, entry[0])
+            except Exception as err:
+                _log_nvml_error(err)
+    if link_count == 0:
+        return
+    gauge('gpu_nvlink_link_count', link_count)
+    gauge('gpu_nvlink_active_links', len(active_links))
+    for name, entry in error_totals.items():
+        if entry[1] > 0:
+            counter(name, entry[1])
+    if not active_links:
+        return
+
+    # NVML_FI_DEV_NVLINK_THROUGHPUT_*: cumulative KiB totals, read in one
+    # batched call — the all-links scope per field, the same fields per
+    # active link, and the link speed: the common speed where the driver
+    # reports it, else each active link's own (H200 on driver 595 answers
+    # only the per-link NVML_FI_DEV_NVLINK_GET_SPEED).
+    throughput_fields = [
+        (NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_TX, 'gpu_nvlink_throughput_data_tx_kibibytes',
+         'gpu_nvlink_link_throughput_data_tx_kibibytes'),
+        (NVML_FI_DEV_NVLINK_THROUGHPUT_DATA_RX, 'gpu_nvlink_throughput_data_rx_kibibytes',
+         'gpu_nvlink_link_throughput_data_rx_kibibytes'),
+        (NVML_FI_DEV_NVLINK_THROUGHPUT_RAW_TX, 'gpu_nvlink_throughput_raw_tx_kibibytes', None),
+        (NVML_FI_DEV_NVLINK_THROUGHPUT_RAW_RX, 'gpu_nvlink_throughput_raw_rx_kibibytes', None),
+    ]
+    requests = [(field_id, NVLINK_ALL_LINKS_SCOPE) for field_id, _, _ in throughput_fields]
+    requests += [(field_id, link) for link in active_links
+                 for field_id, _, _ in throughput_fields]
+    speed_index = len(requests)
+    requests.append((NVML_FI_DEV_NVLINK_SPEED_MBPS_COMMON, 0))
+    per_link_speed_field = globals().get('NVML_FI_DEV_NVLINK_GET_SPEED')
+    if per_link_speed_field is not None:
+        requests += [(per_link_speed_field, link) for link in active_links]
+    try:
+        values = nvmlDeviceGetFieldValues(handle, requests)
+    except Exception as err:
+        _log_nvml_error(err)
+        return
+
+    def read(i):
+        v = values[i]
+        if v.nvmlReturn != NVML_SUCCESS:
+            return None
+        return _nvml_value(v.valueType, v.value)
+
+    n_fields = len(throughput_fields)
+    for f, (_, total_name, link_name) in enumerate(throughput_fields):
+        per_link = [read(n_fields + k * n_fields + f) for k in range(len(active_links))]
+        total = read(f)
+        if total is None and per_link and all(v is not None for v in per_link):
+            # No all-links scope on this driver: the same total from links.
+            total = sum(per_link)
+        if total is not None and total > 0:
+            counter(total_name, total)
+        if link_name is not None:
+            for link, value in zip(active_links, per_link):
+                if value is not None and value > 0:
+                    link_counter(link_name, value, link)
+
+    # MB/s per link and direction; the slowest active link when they differ,
+    # so speed × active links never overstates the peak.
+    speed = read(speed_index)
+    if speed is None or speed <= 0:
+        link_speeds = [read(i) for i in range(speed_index + 1, len(requests))]
+        link_speeds = [v for v in link_speeds if v is not None and v > 0]
+        speed = min(link_speeds) if link_speeds else None
+    if speed is not None and speed > 0:
+        gauge('gpu_nvlink_speed_mbps', speed)
 
 
 def _nvml_value(value_type, value) -> Optional[Union[int, float]]:

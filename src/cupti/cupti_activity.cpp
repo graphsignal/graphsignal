@@ -3,6 +3,7 @@
 #include <cupti.h>
 #include <cuda.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -118,6 +119,46 @@ static std::mutex g_graph_sig_mu;
 constexpr size_t kMaxPooledBuffers = 16;
 static std::mutex g_buffer_pool_mu;
 static std::vector<uint8_t*> g_buffer_pool;
+
+// ---------------------------------------------------------------------------
+// Device time: busy time, kernel time and idle gaps per GPU, from the same
+// kernel and graph records the profiles use.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kMaxDevices = 64;
+
+// Device identity, resolved in the resource callback when a context is
+// created (CUDA calls are fine there, never in bufferCompleted) and read on
+// the record path once `ready` is set. The UUID is formatted the way NVML
+// prints it, so the CUPTI and NVML series join on device.uuid.
+struct DeviceInfo {
+  char uuid[48] = {0};
+  std::atomic<bool> ready{false};
+};
+static DeviceInfo g_device_info[kMaxDevices];
+static std::mutex g_device_info_mu;
+
+// Per-device accounting state. `covered_end` is the end of the union of every
+// interval accounted so far: a new interval that starts after it opens a busy
+// period (and closes an idle gap), one that ends after it extends the current
+// busy period, one that ends before it is already covered. Busy time accrues
+// as intervals arrive, so it never waits for a busy period to close.
+struct DeviceTime {
+  bool started = false;
+  uint64_t covered_end = 0;
+  bool registered = false;
+  graphsignal::Instrument* busy = nullptr;    // counter: union of intervals
+  graphsignal::Instrument* kernel = nullptr;  // counter: sum of intervals
+  graphsignal::Instrument* gaps = nullptr;    // histogram: idle gaps
+};
+static std::mutex g_device_time_mu;
+static DeviceTime g_device_time[kMaxDevices];
+
+struct DeviceInterval {
+  uint32_t device;
+  uint64_t start;
+  uint64_t end;
+};
 
 static uint8_t* buffer_pool_acquire() {
   {
@@ -547,6 +588,82 @@ static void device_probe_reader(const graphsignal_probe_entry* const* entries, s
   }
 }
 
+// Resolves a new context's device ordinal and UUID into g_device_info. Runs
+// in the resource callback; best-effort, a failure leaves the device on the
+// device.index tag.
+static void resolve_device(CUcontext ctx) {
+  if (!ctx) return;
+  uint32_t id = 0;
+  if (cuptiGetDeviceId(ctx, &id) != CUPTI_SUCCESS || id >= kMaxDevices) return;
+  DeviceInfo& info = g_device_info[id];
+  if (info.ready.load(std::memory_order_acquire)) return;
+  CUdevice dev = 0;
+  if (cuDeviceGet(&dev, static_cast<int>(id)) != CUDA_SUCCESS) return;
+  CUuuid uuid;
+  if (cuDeviceGetUuid(&uuid, dev) != CUDA_SUCCESS) return;
+  const unsigned char* b = reinterpret_cast<const unsigned char*>(uuid.bytes);
+  std::lock_guard<std::mutex> g(g_device_info_mu);
+  if (info.ready.load(std::memory_order_relaxed)) return;
+  std::snprintf(info.uuid, sizeof(info.uuid),
+                "GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+                "%02x%02x%02x%02x%02x%02x",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
+                b[10], b[11], b[12], b[13], b[14], b[15]);
+  info.ready.store(true, std::memory_order_release);
+}
+
+// Registers a device's instruments on first use, tagged device.uuid when the
+// UUID is known (always, unless resolution failed) and device.index otherwise.
+// Caller holds g_device_time_mu.
+static void register_device_time(uint32_t device, DeviceTime& t) {
+  t.registered = true;
+  if (!g_writer) return;
+  std::vector<std::pair<std::string, std::string>> tags;
+  if (g_device_info[device].ready.load(std::memory_order_acquire)) {
+    tags.emplace_back("device.uuid", g_device_info[device].uuid);
+  } else {
+    tags.emplace_back("device.index", std::to_string(device));
+  }
+  std::lock_guard<std::mutex> g(g_instruments_mu);
+  t.busy = g_writer->register_instrument(
+      graphsignal::InstrumentType::Counter, "cuda_device_busy_nanoseconds", tags);
+  t.kernel = g_writer->register_instrument(
+      graphsignal::InstrumentType::Counter, "cuda_device_kernel_nanoseconds", tags);
+  t.gaps = g_writer->register_instrument(
+      graphsignal::InstrumentType::Histogram, "cuda_device_idle_gap_nanoseconds", tags);
+}
+
+// Accounts one buffer's kernel and graph intervals, sorted per device by
+// start. Records of one buffer arrive roughly in completion order; across
+// buffers an interval can arrive after a later one was accounted, and then
+// only its part past `covered_end` counts — an undercount of busy time (and
+// an overcount of the gap it fell into) bounded by that reordering.
+static void account_device_time(std::vector<DeviceInterval>& intervals) {
+  if (intervals.empty()) return;
+  std::sort(intervals.begin(), intervals.end(),
+            [](const DeviceInterval& a, const DeviceInterval& b) {
+              return a.device != b.device ? a.device < b.device : a.start < b.start;
+            });
+  std::lock_guard<std::mutex> g(g_device_time_mu);
+  for (const DeviceInterval& iv : intervals) {
+    DeviceTime& t = g_device_time[iv.device];
+    if (!t.registered) register_device_time(iv.device, t);
+    graphsignal::MetricsWriter::add(t.kernel, iv.end - iv.start);
+    if (!t.started) {
+      t.started = true;
+      graphsignal::MetricsWriter::add(t.busy, iv.end - iv.start);
+      t.covered_end = iv.end;
+    } else if (iv.start > t.covered_end) {
+      graphsignal::MetricsWriter::record(t.gaps, iv.start - t.covered_end);
+      graphsignal::MetricsWriter::add(t.busy, iv.end - iv.start);
+      t.covered_end = iv.end;
+    } else if (iv.end > t.covered_end) {
+      graphsignal::MetricsWriter::add(t.busy, iv.end - t.covered_end);
+      t.covered_end = iv.end;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // CUPTI callbacks
 // ---------------------------------------------------------------------------
@@ -561,9 +678,13 @@ static void CUPTIAPI graph_resource_callback(void* /*userdata*/, CUpti_CallbackD
 
   try {
     const auto* rd = reinterpret_cast<const CUpti_ResourceData*>(cbdata);
-    if (!rd || !rd->resourceDescriptor) return;
+    if (!rd) return;
+    if (cbid != CUPTI_CBID_RESOURCE_CONTEXT_CREATED && !rd->resourceDescriptor) return;
 
     switch (cbid) {
+      case CUPTI_CBID_RESOURCE_CONTEXT_CREATED:
+        resolve_device(rd->context);
+        break;
       case CUPTI_CBID_RESOURCE_GRAPHEXEC_CREATED: {
         const auto* gd = reinterpret_cast<const CUpti_GraphData*>(rd->resourceDescriptor);
         const std::string sig = compute_graph_signature(gd->graph);
@@ -624,6 +745,9 @@ static void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* 
 
   try {
   if (validSize > 0) {
+    // Kernel and graph execution intervals of this buffer, for device time.
+    std::vector<DeviceInterval> intervals;
+    intervals.reserve(256);
     CUpti_Activity* record = nullptr;
     CUptiResult status;
     do {
@@ -636,6 +760,9 @@ static void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* 
             if (k->end <= k->start) break;
             graphsignal::MetricsWriter::profile_add(
                 g_kernels_profile, k->name ? k->name : "", k->end - k->start);
+            if (k->deviceId < kMaxDevices) {
+              intervals.push_back({k->deviceId, k->start, k->end});
+            }
             break;
           }
           case CUPTI_ACTIVITY_KIND_GRAPH_TRACE: {
@@ -650,6 +777,9 @@ static void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* 
             graphsignal::MetricsWriter::profile_add(
                 g_graphs_profile, graph_frame_name(g->graphId).c_str(),
                 g->end - g->start);
+            if (g->deviceId < kMaxDevices) {
+              intervals.push_back({g->deviceId, g->start, g->end});
+            }
             break;
           }
           case CUPTI_ACTIVITY_KIND_MEMCPY: {
@@ -706,6 +836,7 @@ static void CUPTIAPI bufferCompleted(CUcontext ctx, uint32_t streamId, uint8_t* 
         }
       }
     } while (status == CUPTI_SUCCESS);
+    account_device_time(intervals);
   }
 
   // Count any dropped records since the previous call (for the debug log only).
@@ -775,6 +906,11 @@ int cupti_activity_start(uint64_t write_interval_ns, uint32_t debug_mode,
   {
     std::lock_guard<std::mutex> g(g_graph_sig_mu);
     g_graph_signatures.clear();
+  }
+  {
+    // Instrument pointers belong to the current Writer only.
+    std::lock_guard<std::mutex> g(g_device_time_mu);
+    for (auto& t : g_device_time) t = DeviceTime{};
   }
 
   // No Writer flush hook: the flush runs on its own thread (see flush_loop).

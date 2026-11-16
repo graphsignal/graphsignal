@@ -57,6 +57,10 @@ class Watcher:
             metrics_port=None,
             metrics_path=None,
             metrics_host=None,
+            health_port=None,
+            health_path=None,
+            health_host=None,
+            dcgm_exporter_url=None,
             listen_host=None,
             listen_port=None,
             listen_fd=None,
@@ -78,6 +82,10 @@ class Watcher:
         self._metrics_port = int(metrics_port) if metrics_port is not None else None
         self._metrics_path = metrics_path
         self._metrics_host = metrics_host
+        self._health_port = int(health_port) if health_port is not None else None
+        self._health_path = health_path
+        self._health_host = health_host
+        self._dcgm_exporter_url = dcgm_exporter_url
         self._listen_host = str(listen_host) if listen_host is not None else DEFAULT_LISTEN_HOST
         self._listen_port = int(listen_port) if listen_port is not None else DEFAULT_LISTEN_PORT
         self._listen_fd = int(listen_fd) if listen_fd is not None else None
@@ -198,12 +206,21 @@ class Watcher:
             ('graphsignal.recorders.amdsmi_recorder', 'AmdSmiRecorder', {}),
             ('graphsignal.recorders.nic_recorder', 'NicRecorder', {}),
         ]
-        if self._metrics_port is not None:
+        if self._metrics_port is not None or self._health_port is not None:
             specs.append((
-                'graphsignal.recorders.prometheus_recorder', 'PrometheusRecorder',
+                'graphsignal.recorders.engine_recorder', 'EngineRecorder',
                 dict(metrics_port=self._metrics_port,
                      metrics_path=self._metrics_path,
-                     metrics_host=self._metrics_host)))
+                     metrics_host=self._metrics_host,
+                     health_port=self._health_port,
+                     health_path=self._health_path,
+                     health_host=self._health_host)))
+        if self._dcgm_exporter_url is not None:
+            # After NVMLRecorder, whose device resources scope it to this
+            # workload's GPUs.
+            specs.append((
+                'graphsignal.recorders.dcgm_recorder', 'DcgmRecorder',
+                dict(exporter_url=self._dcgm_exporter_url)))
         specs.extend([
             ('graphsignal.recorders.process_recorder', 'ProcessRecorder', {}),
             ('graphsignal.recorders.thread_recorder', 'ThreadRecorder', {}),

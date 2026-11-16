@@ -57,7 +57,9 @@ class SglangLaunchTest(unittest.TestCase):
         # No --port in argv → falls back to SGLang's default serving port (30000).
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'serve', '--enable-metrics'],
-            metrics_port=30000, listen_host=None, listen_port=18301)
+            metrics_port=30000,
+            health_port=30000, health_path='/ready,/ping', health_host='127.0.0.1',
+            dcgm_exporter_url=None, listen_host=None, listen_port=18301)
         self.assertNotIn('--enable-trace', fx.launched_argv)
         self.assertNotIn('--otlp-traces-endpoint', fx.launched_argv)
 
@@ -67,7 +69,9 @@ class SglangLaunchTest(unittest.TestCase):
             launcher.launch()
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'serve', '--port', '30001', '--enable-metrics'],
-            metrics_port=30001, listen_host=None, listen_port=None)
+            metrics_port=30001,
+            health_port=30001, health_path='/ready,/ping', health_host='127.0.0.1',
+            dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_launch_explicit_metrics_port_overrides_engine_args(self):
         launcher = SglangLauncher(
@@ -76,7 +80,9 @@ class SglangLaunchTest(unittest.TestCase):
             launcher.launch()
         fx.launch_supervised_m.assert_called_once_with(
             ['/abs/exec', 'serve', '--port', '30001', '--enable-metrics'],
-            metrics_port=9999, listen_host=None, listen_port=None)
+            metrics_port=9999,
+            health_port=30001, health_path='/ready,/ping', health_host='127.0.0.1',
+            dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_launch_raises_when_executable_missing(self):
         launcher = SglangLauncher(['sglang'])

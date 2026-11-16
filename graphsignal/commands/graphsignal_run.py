@@ -55,6 +55,11 @@ Options (must precede the command):
                   for it, so use it for an investigation, not in production.
                   Also settable via GRAPHSIGNAL_ROCM_KERNEL_TRACE; the flag
                   wins.
+  --dcgm-exporter URL
+                  Full URL of a node-local NVIDIA dcgm-exporter metrics
+                  endpoint (e.g. http://<node-ip>:9400/metrics) to import
+                  its DCGM_FI_PROF_* profiling metrics (SM, tensor and DRAM
+                  activity) for this workload's GPUs. Off unless given.
 
 Example:
   graphsignal-run vllm serve facebook/opt-125m --port 8001
@@ -77,6 +82,7 @@ def _extract_graphsignal_flags(argv):
     bind address.
     `--cuda-graph-trace` selects the CUDA graph tracing granularity.
     `--rocm-kernel-trace` switches per-kernel tracing on ROCm on or off.
+    `--dcgm-exporter` names a dcgm-exporter endpoint to import from.
     All are consumed here and never forwarded to the workload. Only leading
     flags (before the workload command) are parsed, so identically named
     workload flags later in argv are left untouched.
@@ -86,6 +92,7 @@ def _extract_graphsignal_flags(argv):
     listen_port = None
     cuda_graph_trace = None
     rocm_kernel_trace = None
+    dcgm_exporter_url = None
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -144,9 +151,20 @@ def _extract_graphsignal_flags(argv):
             rocm_kernel_trace = _parse_rocm_kernel_trace(arg.split('=', 1)[1])
             i += 1
             continue
+        if arg == '--dcgm-exporter':
+            if i + 1 >= len(argv):
+                print("graphsignal-run: --dcgm-exporter requires a value\n")
+                sys.exit(1)
+            dcgm_exporter_url = _parse_dcgm_exporter_url(argv[i + 1])
+            i += 2
+            continue
+        if arg.startswith('--dcgm-exporter='):
+            dcgm_exporter_url = _parse_dcgm_exporter_url(arg.split('=', 1)[1])
+            i += 1
+            continue
         break
     return (metrics_port, listen_host, listen_port, cuda_graph_trace,
-            rocm_kernel_trace, argv[i:])
+            rocm_kernel_trace, dcgm_exporter_url, argv[i:])
 
 
 def _parse_port(flag, value):
@@ -164,6 +182,17 @@ def _parse_cuda_graph_trace(value):
               % (value, '|'.join(CUDA_GRAPH_TRACE_MODES)))
         sys.exit(1)
     return mode
+
+
+def _parse_dcgm_exporter_url(value):
+    url = (value or '').strip()
+    if not (url.startswith('http://') or url.startswith('https://')) \
+            or len(url.split('://', 1)[1]) == 0:
+        print("graphsignal-run: invalid --dcgm-exporter value: %s "
+              "(expected a full http(s):// URL, e.g. http://<node-ip>:9400/metrics)\n"
+              % value)
+        sys.exit(1)
+    return url
 
 
 def _parse_rocm_kernel_trace(value):
@@ -197,15 +226,18 @@ def main():
     _setup_logging()
 
     (metrics_port, listen_host, listen_port, cuda_graph_trace,
-     rocm_kernel_trace, target_args) = _extract_graphsignal_flags(sys.argv[1:])
+     rocm_kernel_trace, dcgm_exporter_url,
+     target_args) = _extract_graphsignal_flags(sys.argv[1:])
     log.debug('graphsignal-run target args: %s (metrics_port=%s, listen_host=%s, '
-              'listen_port=%s, cuda_graph_trace=%s, rocm_kernel_trace=%s)',
+              'listen_port=%s, cuda_graph_trace=%s, rocm_kernel_trace=%s, '
+              'dcgm_exporter_url=%s)',
               target_args, metrics_port, listen_host, listen_port, cuda_graph_trace,
-              rocm_kernel_trace)
+              rocm_kernel_trace, dcgm_exporter_url)
 
     launcher_kwargs = dict(
         metrics_port=metrics_port, listen_host=listen_host, listen_port=listen_port,
-        cuda_graph_trace=cuda_graph_trace, rocm_kernel_trace=rocm_kernel_trace)
+        cuda_graph_trace=cuda_graph_trace, rocm_kernel_trace=rocm_kernel_trace,
+        dcgm_exporter_url=dcgm_exporter_url)
     launchers = [
         VllmLauncher(target_args, **launcher_kwargs),
         SglangLauncher(target_args, **launcher_kwargs),

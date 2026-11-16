@@ -14,6 +14,9 @@ Usage:
   graphsignal-watch --pid PID
                     [--metrics-port PORT] [--metrics-path PATH]
                     [--metrics-host HOST]
+                    [--health-port PORT] [--health-path PATH]
+                    [--health-host HOST]
+                    [--dcgm-exporter URL]
                     [--listen-host HOST] [--listen-port PORT]
                     [--listen-fd FD]
 """
@@ -35,6 +38,15 @@ def main():
     parser.add_argument('--metrics-host', type=str, default=None,
                         help='HTTP host for the Prometheus metrics endpoint '
                              '(default: 127.0.0.1)')
+    parser.add_argument('--health-port', type=int, default=None,
+                        help="Engine serving port to probe for health")
+    parser.add_argument('--health-path', type=str, default=None,
+                        help='HTTP path of the health probe (default: /health)')
+    parser.add_argument('--health-host', type=str, default=None,
+                        help='HTTP host of the health probe (default: 127.0.0.1)')
+    parser.add_argument('--dcgm-exporter', type=str, default=None,
+                        help='dcgm-exporter metrics URL to import DCGM '
+                             'profiling metrics from')
     parser.add_argument('--listen-host', type=str, default=None,
                         help='Host to bind the /signals HTTP endpoint to '
                              '(default: 127.0.0.1; any other value exposes '
@@ -54,6 +66,10 @@ def main():
             metrics_port=args.metrics_port,
             metrics_path=args.metrics_path,
             metrics_host=args.metrics_host,
+            health_port=args.health_port,
+            health_path=args.health_path,
+            health_host=args.health_host,
+            dcgm_exporter_url=args.dcgm_exporter,
             listen_host=args.listen_host,
             listen_port=args.listen_port,
             listen_fd=args.listen_fd,

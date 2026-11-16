@@ -9,7 +9,7 @@ from unittest.mock import patch, MagicMock
 from graphsignal.launchers import command_utils
 from graphsignal.launchers.command_utils import (
     bind_listen_socket, extract_host, extract_port, resolve_metrics_host,
-    resolve_metrics_port, start_watcher)
+    resolve_metrics_port, resolve_probe_host, start_watcher)
 
 
 class RemovedHelpersTest(unittest.TestCase):
@@ -151,10 +151,50 @@ class StartWatcherTest(unittest.TestCase):
              '--metrics-host', 'localhost', '--listen-host', '0.0.0.0',
              '--listen-port', '18400'])
 
+    def test_spawn_args_with_health(self):
+        with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
+            start_watcher(54321, health_port=8000, health_path='/ready',
+                          health_host='10.0.0.5')
+        cmd = popen_m.call_args[0][0]
+        self.assertEqual(
+            cmd[5:], ['--health-port', '8000', '--health-path', '/ready',
+                      '--health-host', '10.0.0.5'])
+
+    def test_spawn_args_with_dcgm_exporter(self):
+        with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
+            start_watcher(54321, dcgm_exporter_url='http://10.0.0.7:9400/metrics')
+        cmd = popen_m.call_args[0][0]
+        self.assertEqual(
+            cmd[5:], ['--dcgm-exporter', 'http://10.0.0.7:9400/metrics'])
+
     def test_returns_none_on_failure(self):
         with patch.object(subprocess, 'Popen', side_effect=OSError('boom')):
             result = start_watcher(1)
         self.assertIsNone(result)
+
+
+class ResolveProbeHostTest(unittest.TestCase):
+    def test_absent_host_uses_default(self):
+        self.assertEqual(resolve_probe_host(['serve']), '127.0.0.1')
+        self.assertEqual(resolve_probe_host(['serve'], default='localhost'),
+                         'localhost')
+
+    def test_wildcard_binds_map_to_default(self):
+        for host in ('0.0.0.0', '::', '[::]'):
+            with self.subTest(host=host):
+                self.assertEqual(
+                    resolve_probe_host(['serve', '--host', host]), '127.0.0.1')
+        self.assertEqual(resolve_probe_host(['serve', '--host=']), '127.0.0.1')
+        # Loopback, not the engine's default host name.
+        self.assertEqual(
+            resolve_probe_host(['serve', '--host', '0.0.0.0'], default='localhost'),
+            '127.0.0.1')
+
+    def test_specific_host_is_kept(self):
+        self.assertEqual(resolve_probe_host(['serve', '--host', '10.0.0.5']),
+                         '10.0.0.5')
+        self.assertEqual(resolve_probe_host(['serve', '--host=localhost']),
+                         'localhost')
 
 
 class ListenSocketTest(unittest.TestCase):

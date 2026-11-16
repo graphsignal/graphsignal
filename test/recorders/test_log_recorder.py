@@ -11,8 +11,9 @@ import graphsignal.watcher
 from graphsignal.recorders import log_recorder as log_recorder_mod
 from graphsignal.recorders import shm_files
 from graphsignal.recorders.log_recorder import (
-    LogRecorder, _StreamExtractor, _sweep_stale_shm_dirs)
-from test.test_utils import configure_test_watcher
+    ERROR_CLASSES, LogRecorder, _StreamExtractor, _sweep_stale_shm_dirs,
+    classify_error)
+from test.test_utils import configure_test_watcher, find_metric
 
 
 def extract_all(lines):
@@ -71,6 +72,41 @@ class ExtractorVllmTest(unittest.TestCase):
             'WARNING 07-16 10:22:33 [a.py:3] meh',
         ])
         self.assertEqual(entries, [])
+
+
+class ExtractorVllmProcessPrefixTest(unittest.TestCase):
+    # vLLM v1 prefixes every line with its process name (lines from vLLM 0.33.0).
+    def test_api_server_traceback_grouped_and_classified(self):
+        entries = extract_all([
+            '(APIServer pid=17522) INFO 11-15 09:26:10 [api_server.py:1] serving',
+            '(APIServer pid=17522) ERROR 11-15 09:26:13 [async_llm.py:943] AsyncLLM output_handler failed.',
+            '(APIServer pid=17522) ERROR 11-15 09:26:13 [async_llm.py:943] Traceback (most recent call last):',
+            '(APIServer pid=17522) ERROR 11-15 09:26:13 [async_llm.py:943]   File "/x/async_llm.py", line 880, in output_handler',
+            '(APIServer pid=17522) ERROR 11-15 09:26:13 [async_llm.py:943]     outputs = await engine_core.get_output_async()',
+            '(APIServer pid=17522) ERROR 11-15 09:26:13 [async_llm.py:943] vllm.v1.engine.exceptions.EngineDeadError: EngineCore encountered an issue. See stack trace (above) for the root cause.',
+            '(APIServer pid=17522) INFO 11-15 09:26:14 [launcher.py:1] Shutting down',
+        ])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['message'], 'AsyncLLM output_handler failed.')
+        self.assertIn('EngineDeadError', entries[0]['exception'])
+        self.assertNotIn('(APIServer', entries[0]['exception'])
+        self.assertEqual(classify_error(entries[0]['message'], entries[0]['exception']),
+                         'engine')
+
+    def test_worker_and_engine_prefixes(self):
+        entries = extract_all([
+            '(Worker_TP1 pid=8812) ERROR 11-15 09:30:01 [gpu_worker.py:1] RuntimeError: CUDA error: an illegal memory access was encountered',
+            '(EngineCore_DP0 pid=8800) ERROR 11-15 09:30:02 [core.py:1] torch.OutOfMemoryError: CUDA out of memory.',
+            '(EngineCore pid=8800) INFO 11-15 09:30:03 [core.py:2] done',
+        ])
+        self.assertEqual([classify_error(e['message']) for e in entries],
+                         ['cuda_error', 'gpu_oom'])
+
+    def test_prefix_alone_does_not_make_an_error(self):
+        self.assertEqual(extract_all([
+            '(APIServer pid=1) INFO 11-15 09:26:10 [api_server.py:1] fine',
+            '(Worker pid=2) WARNING 11-15 09:26:10 [w.py:1] meh',
+        ]), [])
 
 
 class ExtractorSglangTest(unittest.TestCase):
@@ -189,6 +225,74 @@ class ExtractorGenericTest(unittest.TestCase):
             'ERRORS_TOTAL 5',  # no word boundary match
         ])
         self.assertEqual(entries, [])
+
+
+class ClassifyErrorTest(unittest.TestCase):
+    CASES = [
+        # gpu_oom
+        ('torch.OutOfMemoryError: CUDA out of memory. Tried to allocate '
+         '2.00 GiB. GPU 0 has a total capacity of 79.10 GiB of which '
+         '1.23 GiB is free.', 'gpu_oom'),
+        ('torch.OutOfMemoryError: HIP out of memory. Tried to allocate '
+         '1.00 GiB.', 'gpu_oom'),
+        ('RuntimeError: CUDA error: out of memory', 'gpu_oom'),
+        ('[TensorRT-LLM][ERROR] CUDA runtime error in '
+         '::cudaMallocAsync(ptr, n, mCudaStream->get()): out of memory',
+         'gpu_oom'),
+        ('ValueError: No available memory for the cache blocks. Try '
+         'increasing `gpu_memory_utilization` when initializing the engine.',
+         'gpu_oom'),
+        # cuda_error
+        ('RuntimeError: CUDA error: an illegal memory access was encountered',
+         'cuda_error'),
+        ('[PG ID 0 PG GUID 0(default_pg) Rank 3] Process group watchdog '
+         'thread terminated with exception: CUDA error: an illegal memory '
+         'access was encountered', 'cuda_error'),
+        ('RuntimeError: CUDA error: device-side assert triggered',
+         'cuda_error'),
+        ('RuntimeError: CUDA error: unspecified launch failure', 'cuda_error'),
+        ('RuntimeError: HIP error: invalid device function', 'cuda_error'),
+        ('[TensorRT-LLM][ERROR] CUDA runtime error in '
+         '::cudaStreamSynchronize(stream): an illegal memory access was '
+         'encountered', 'cuda_error'),
+        # nccl
+        ('[Rank 1] Watchdog caught collective operation timeout: '
+         'WorkNCCL(SeqNum=12, OpType=ALLREDUCE, NumelIn=1, NumelOut=1, '
+         'Timeout(ms)=600000) ran for 600012 milliseconds before timing out.',
+         'nccl'),
+        ('torch.distributed.DistBackendError: NCCL error in: '
+         '../torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp:1970, '
+         'unhandled cuda error (run with NCCL_DEBUG=INFO for details), '
+         'NCCL version 2.21.5', 'nccl'),
+        ('NCCL WARN ncclRemoteError: A call failed possibly due to a network '
+         'error or a remote process exiting prematurely.', 'nccl'),
+        # engine
+        ('vllm serve: error: unrecognized arguments: --bogus', 'engine'),
+        ('Scheduler hit an exception: ValueError: bad request', 'engine'),
+        ('MemoryError', 'engine'),
+        ('EngineCore encountered a fatal error.', 'engine'),
+    ]
+
+    def test_classes(self):
+        for message, expected in self.CASES:
+            with self.subTest(message=message):
+                self.assertEqual(classify_error(message), expected)
+
+    def test_exception_text_is_classified_too(self):
+        self.assertEqual(
+            classify_error('Scheduler hit an exception:',
+                           'Traceback (most recent call last):\n'
+                           '  File "x.py", line 1, in f\n'
+                           'torch.OutOfMemoryError: CUDA out of memory.'),
+            'gpu_oom')
+
+    def test_root_cause_wins(self):
+        # An out-of-memory reported as a CUDA error is an OOM, and a CUDA
+        # fault reported by NCCL's watchdog is a CUDA error.
+        self.assertEqual(classify_error('ProcessGroupNCCL watchdog: CUDA error: '
+                                        'out of memory'), 'gpu_oom')
+        self.assertEqual(classify_error('ProcessGroupNCCL watchdog: CUDA error: '
+                                        'misaligned address'), 'cuda_error')
 
 
 class LogRecorderDrainTest(unittest.TestCase):
@@ -350,6 +454,85 @@ class LogRecorderDrainTest(unittest.TestCase):
 
         messages = [e['message'] for e in self._workload_entries()]
         self.assertEqual(messages, ['dying words'])
+
+    def _error_totals(self):
+        exported = self.watcher.metric_store().export()
+        totals = {}
+        for error_class in ERROR_CLASSES:
+            metric = find_metric(exported, 'workload_errors',
+                                 {'class': error_class}, metric_type='counter')
+            totals[error_class] = None if metric is None else metric.datapoint['total']
+        return totals
+
+    def test_error_counters_published_at_zero(self):
+        self.recorder._disabled = False
+        self.recorder.on_tick()
+        self.assertEqual(self._error_totals(),
+                         {c: 0 for c in ERROR_CLASSES})
+
+    def test_disabled_recorder_publishes_no_error_counters(self):
+        self.recorder._disabled = True
+        self.recorder.on_tick()
+        self.assertEqual(self._error_totals(),
+                         {c: None for c in ERROR_CLASSES})
+
+    def test_error_counters_by_class(self):
+        self.recorder._disabled = False
+        self._write_segment(0, [
+            'ERROR 07-16 10:22:33 [a.py:1] RuntimeError: CUDA error: an '
+            'illegal memory access was encountered',
+            'ERROR 07-16 10:22:33 [a.py:2] torch.OutOfMemoryError: CUDA out '
+            'of memory. Tried to allocate 2.00 GiB.',
+            'ERROR 07-16 10:22:33 [a.py:3] torch.OutOfMemoryError: CUDA out '
+            'of memory. Tried to allocate 1.00 GiB.',
+            'ERROR 07-16 10:22:33 [a.py:4] something else broke',
+            'INFO 07-16 10:22:34 [a.py:5] next',
+        ])
+        self.recorder.on_tick()
+        self.assertEqual(self._error_totals(), {
+            'gpu_oom': 2, 'cuda_error': 1, 'nccl': 0, 'engine': 1})
+
+        # Totals are cumulative across drains.
+        self._write_segment(0, [
+            'ERROR 07-16 10:22:35 [a.py:6] [Rank 1] Watchdog caught '
+            'collective operation timeout: WorkNCCL(SeqNum=12)',
+            'INFO 07-16 10:22:36 [a.py:7] next',
+        ])
+        self.recorder.on_tick()
+        self.assertEqual(self._error_totals(), {
+            'gpu_oom': 2, 'cuda_error': 1, 'nccl': 1, 'engine': 1})
+
+    def test_error_counters_exact_past_rate_cap(self):
+        self.recorder._disabled = False
+        lines = ['ERROR 07-16 10:22:33 [a.py:%d] err-%03d' % (i, i)
+                 for i in range(60)]
+        lines.append('INFO 07-16 10:22:34 [a.py:99] next')
+        self._write_segment(0, lines)
+        self.recorder.on_tick()
+
+        self.assertEqual(len(self._workload_entries()),
+                         log_recorder_mod.MAX_ENTRIES_PER_DRAIN)
+        self.assertEqual(self._error_totals()['engine'], 60)
+
+    def test_exit_status_records_not_counted(self):
+        self.recorder._disabled = False
+        self._write_segment(0, ['ERROR 07-16 10:22:33 [a.py:1] fatal',
+                                'INFO 07-16 10:22:34 [a.py:2] next'])
+        self._write_records(0, [{'ts': 2000, 'exit_code': 1},
+                                {'ts': 2001, 'signal': 9}])
+        self.recorder.on_tick()
+
+        # Both exit records still land in the log store as errors...
+        self.assertEqual(len(self._workload_entries()), 3)
+        # ...but only the console error line is counted.
+        self.assertEqual(sum(self._error_totals().values()), 1)
+
+    def test_finalize_counts_pending_trailing_error(self):
+        self._write_segment(0, ['ERROR 07-16 10:22:33 [a.py:1] RuntimeError: '
+                                'CUDA error: misaligned address'])
+        self.recorder._disabled = False
+        self.recorder.finalize()
+        self.assertEqual(self._error_totals()['cuda_error'], 1)
 
     def test_shutdown_cleans_dir_without_recording(self):
         # shutdown() is cleanup-only (the terminated path drains via

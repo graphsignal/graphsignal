@@ -49,14 +49,14 @@ class FallbackLaunchTest(unittest.TestCase):
         # Generic workload without --port → no Prometheus scrape port.
         self.launch_m.assert_called_once_with(
             ['/abs/my_script.py', '--flag'],
-            metrics_port=None, listen_host=None, listen_port=None)
+            metrics_port=None, dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_executable_on_path_launches(self):
         with patch.object(fallback_mod, '_resolve', return_value='/usr/bin/myapp'):
             FallbackLauncher(['myapp', '--flag']).launch()
         self.launch_m.assert_called_once_with(
             ['/usr/bin/myapp', '--flag'],
-            metrics_port=None, listen_host=None, listen_port=None)
+            metrics_port=None, dcgm_exporter_url=None, listen_host=None, listen_port=None)
         self.cupti_env_m.assert_called_once_with(cuda_graph_trace=None)
         self.rocm_env_m.assert_called_once_with(cuda_graph_trace=None, rocm_kernel_trace=None)
 
@@ -64,27 +64,27 @@ class FallbackLaunchTest(unittest.TestCase):
         with patch.object(fallback_mod, '_resolve', return_value='/usr/bin/myapp'):
             FallbackLauncher(['myapp'], metrics_port=9999).launch()
         self.launch_m.assert_called_once_with(
-            ['/usr/bin/myapp'], metrics_port=9999, listen_host=None, listen_port=None)
+            ['/usr/bin/myapp'], metrics_port=9999, dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_listen_port_forwarded(self):
         with patch.object(fallback_mod, '_resolve', return_value='/usr/bin/myapp'):
             FallbackLauncher(['myapp'], listen_port=18303).launch()
         self.launch_m.assert_called_once_with(
-            ['/usr/bin/myapp'], metrics_port=None, listen_host=None, listen_port=18303)
+            ['/usr/bin/myapp'], metrics_port=None, dcgm_exporter_url=None, listen_host=None, listen_port=18303)
 
     def test_metrics_port_from_workload_port_flag(self):
         with patch.object(fallback_mod, '_resolve', return_value='/usr/bin/myapp'):
             FallbackLauncher(['myapp', '--port', '8080']).launch()
         self.launch_m.assert_called_once_with(
             ['/usr/bin/myapp', '--port', '8080'],
-            metrics_port=8080, listen_host=None, listen_port=None)
+            metrics_port=8080, dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_unresolved_runs_python_dash_m(self):
         with patch.object(fallback_mod, '_resolve', return_value=None):
             FallbackLauncher(['my.module', '--flag']).launch()
         self.launch_m.assert_called_once_with(
             [sys.executable, '-m', 'my.module', '--flag'],
-            metrics_port=None, listen_host=None, listen_port=None)
+            metrics_port=None, dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
 
 if __name__ == '__main__':

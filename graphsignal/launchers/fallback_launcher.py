@@ -37,6 +37,7 @@ class FallbackLauncher(BaseLauncher):
             logger.debug('FallbackLauncher launch: %s %s', executable, rest)
             launch_supervised([executable] + rest,
                               metrics_port=metrics_port,
+                              dcgm_exporter_url=self.dcgm_exporter_url,
                               listen_host=self.listen_host,
                               listen_port=self.listen_port)
             return
@@ -46,5 +47,6 @@ class FallbackLauncher(BaseLauncher):
         logger.debug('FallbackLauncher launch python -m: %s', command)
         launch_supervised([sys.executable, '-m', command] + rest,
                           metrics_port=metrics_port,
+                          dcgm_exporter_url=self.dcgm_exporter_url,
                           listen_host=self.listen_host,
                           listen_port=self.listen_port)

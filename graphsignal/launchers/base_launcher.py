@@ -12,7 +12,8 @@ class BaseLauncher(ABC):
                  listen_host: Optional[str] = None,
                  listen_port: Optional[int] = None,
                  cuda_graph_trace: Optional[str] = None,
-                 rocm_kernel_trace: Optional[str] = None):
+                 rocm_kernel_trace: Optional[str] = None,
+                 dcgm_exporter_url: Optional[str] = None):
         self.args: List[str] = list(args)
         # Explicit Prometheus scrape port from `graphsignal-run --metrics-port`.
         # When None, each launcher derives it from the engine's --port/default.
@@ -34,6 +35,9 @@ class BaseLauncher(ABC):
         # variable (if any) is left as inherited, and the native default
         # ('none') applies.
         self.rocm_kernel_trace: Optional[str] = rocm_kernel_trace
+        # dcgm-exporter metrics URL from `graphsignal-run --dcgm-exporter`,
+        # handed to the watcher's DcgmRecorder. None leaves it off.
+        self.dcgm_exporter_url: Optional[str] = dcgm_exporter_url
 
     @abstractmethod
     def match(self) -> bool:
