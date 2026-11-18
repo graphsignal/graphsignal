@@ -10,11 +10,14 @@ logger = logging.getLogger('graphsignal')
 
 REDACTED = '[redacted]'
 
-# Flags whose value is a credential: `--api-key`, `--hf-token`, `--password`, ...
-_CREDENTIAL_FLAG_RE = re.compile(
-    r'^--?(?:[a-z0-9]+[-_])*'
-    r'(?:api[-_]?key|access[-_]?key|secret[-_]?key|token|secret|password|passwd|credentials?)$',
-    re.IGNORECASE)
+# Names whose value is a credential: `api_key`, `hf-token`, `ssl_keyfile_password`, ...
+_CREDENTIAL_NAME = (
+    r'(?:[a-z0-9]+[-_])*'
+    r'(?:api[-_]?key|access[-_]?key|secret[-_]?key|token|secret|password|passwd|credentials?)')
+# The same names as command-line flags: `--api-key`, `--hf-token`, `--password`, ...
+_CREDENTIAL_FLAG_RE = re.compile(r'^--?' + _CREDENTIAL_NAME + r'$', re.IGNORECASE)
+# The same names as keys, e.g. in an engine's configuration.
+CREDENTIAL_NAME_RE = re.compile(r'^' + _CREDENTIAL_NAME + r'$', re.IGNORECASE)
 
 
 def redact_command_line(cmdline):

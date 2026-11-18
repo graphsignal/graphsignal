@@ -8,6 +8,12 @@ MAX_TAG_KEY_LEN = 50
 MAX_TAG_VALUE_LEN = 250
 MAX_ATTRIBUTE_VALUE_LEN = 2500
 
+# Kinds whose attribute values are stored whole. The engine resource carries
+# the engine's effective configuration as one JSON payload, and a cut would
+# leave JSON that no longer parses. Tags stay capped: they are the resource's
+# identity.
+UNCAPPED_ATTRIBUTE_KINDS = frozenset({'engine'})
+
 
 class ResourceStore:
     def __init__(self):
@@ -35,12 +41,13 @@ class ResourceStore:
             for key, value in tags.items():
                 norm_tags[str(key)[:MAX_TAG_KEY_LEN]] = str(value)[:MAX_TAG_VALUE_LEN]
 
+        value_cap = None if kind in UNCAPPED_ATTRIBUTE_KINDS else MAX_ATTRIBUTE_VALUE_LEN
         norm_attributes = {}
         if attributes:
             for key, value in attributes.items():
                 if value is None:
                     continue
-                norm_attributes[str(key)[:MAX_TAG_KEY_LEN]] = str(value)[:MAX_ATTRIBUTE_VALUE_LEN]
+                norm_attributes[str(key)[:MAX_TAG_KEY_LEN]] = str(value)[:value_cap]
 
         resource_key = (kind, frozenset(norm_tags.items()))
 

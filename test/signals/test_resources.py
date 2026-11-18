@@ -67,6 +67,18 @@ class ResourceStoreTest(unittest.TestCase):
         self.assertEqual(exported['tags'], {'k' * 50: 'v' * 250})
         self.assertEqual(exported['attributes'], {'a' * 50: 'b' * 2500})
 
+    def test_engine_attributes_not_truncated(self):
+        config = '{"settings": "' + 'x' * 20000 + '"}'
+        self.store.update_resource(
+            'engine',
+            tags={'k' * 100: 'v' * 500},
+            attributes={'engine.config': config})
+
+        exported = self.store.export()[0]
+        self.assertEqual(exported['attributes'], {'engine.config': config})
+        # Tags are the resource's identity and stay capped for every kind.
+        self.assertEqual(exported['tags'], {'k' * 50: 'v' * 250})
+
     def test_export_non_destructive(self):
         self.store.update_resource('process', tags={'process.pid': '1'},
                                    attributes={'a': '1'},

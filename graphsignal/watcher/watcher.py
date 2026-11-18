@@ -60,6 +60,7 @@ class Watcher:
             health_port=None,
             health_path=None,
             health_host=None,
+            engine=None,
             dcgm_exporter_url=None,
             listen_host=None,
             listen_port=None,
@@ -85,6 +86,7 @@ class Watcher:
         self._health_port = int(health_port) if health_port is not None else None
         self._health_path = health_path
         self._health_host = health_host
+        self._engine = engine
         self._dcgm_exporter_url = dcgm_exporter_url
         self._listen_host = str(listen_host) if listen_host is not None else DEFAULT_LISTEN_HOST
         self._listen_port = int(listen_port) if listen_port is not None else DEFAULT_LISTEN_PORT
@@ -214,7 +216,8 @@ class Watcher:
                      metrics_host=self._metrics_host,
                      health_port=self._health_port,
                      health_path=self._health_path,
-                     health_host=self._health_host)))
+                     health_host=self._health_host,
+                     engine=self._engine)))
         if self._dcgm_exporter_url is not None:
             # After NVMLRecorder, whose device resources scope it to this
             # workload's GPUs.

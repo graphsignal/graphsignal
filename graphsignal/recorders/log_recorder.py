@@ -288,9 +288,7 @@ class LogRecorder(BaseRecorder):
         self._error_totals: Dict[str, int] = {c: 0 for c in ERROR_CLASSES}
 
     def _shm_dir(self) -> str:
-        # Written by the graphsignal-run supervisor; own prefix so the
-        # CUPTI/ROCm sweepers and rmtrees can never touch it (and vice versa).
-        return os.path.join(_SHM_BASE, f'{_LOG_DIR_PREFIX}{self.pid}')
+        return console_log_dir(self.pid)
 
     def setup(self):
         if not sys.platform.startswith('linux'):
@@ -472,6 +470,30 @@ def _exit_status_entry(record: dict) -> Optional[dict]:
                 'message': f'Process exited with non-zero code {code}',
                 'exception': ''}
     return None
+
+
+def console_log_dir(pid) -> str:
+    """Where the graphsignal-run supervisor writes `pid`'s console lines; own
+    prefix so the CUPTI/ROCm sweepers and rmtrees can never touch it (and
+    vice versa)."""
+    return os.path.join(_SHM_BASE, f'{_LOG_DIR_PREFIX}{pid}')
+
+
+def console_segment_paths(pid) -> List[str]:
+    """`pid`'s console segment files, oldest first: JSONL, one
+    `{"ts", "stream", "line"}` record per line. Empty when there is no owned
+    directory, e.g. a target not started by graphsignal-run."""
+    shm_dir = console_log_dir(pid)
+    if not is_owned_dir(shm_dir):
+        return []
+    try:
+        names = os.listdir(shm_dir)
+    except OSError:
+        return []
+    segments = sorted((int(m.group(1)), name)
+                      for m in (_SEGMENT_RE.match(n) for n in names) if m
+                      for name in [m.group(0)])
+    return [os.path.join(shm_dir, name) for _, name in segments]
 
 
 def _sweep_stale_shm_dirs():

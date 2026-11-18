@@ -105,6 +105,7 @@ class SupervisorLaunchTest(unittest.TestCase):
                               metrics_port=8000, metrics_path='/m',
                               metrics_host='h', health_port=8001,
                               health_path='/ready', health_host='hh',
+                              engine='sglang',
                               dcgm_exporter_url='http://n:9400/metrics',
                               listen_host='0.0.0.0', listen_port=18400)
 
@@ -114,6 +115,7 @@ class SupervisorLaunchTest(unittest.TestCase):
         self.assertEqual(kwargs, {
             'metrics_port': 8000, 'metrics_path': '/m', 'metrics_host': 'h',
             'health_port': 8001, 'health_path': '/ready', 'health_host': 'hh',
+            'engine': 'sglang',
             'dcgm_exporter_url': 'http://n:9400/metrics',
             'listen_host': '0.0.0.0', 'listen_port': 18400,
             'listen_socket': self.listen_socket})

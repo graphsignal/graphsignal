@@ -16,6 +16,7 @@ Usage:
                     [--metrics-host HOST]
                     [--health-port PORT] [--health-path PATH]
                     [--health-host HOST]
+                    [--engine NAME]
                     [--dcgm-exporter URL]
                     [--listen-host HOST] [--listen-port PORT]
                     [--listen-fd FD]
@@ -44,6 +45,10 @@ def main():
                         help='HTTP path of the health probe (default: /health)')
     parser.add_argument('--health-host', type=str, default=None,
                         help='HTTP host of the health probe (default: 127.0.0.1)')
+    parser.add_argument('--engine', type=str, default=None,
+                        help='Inference engine (vllm, sglang): its version and '
+                             'configuration are read from the health probe\'s '
+                             'host and port and recorded as the engine resource')
     parser.add_argument('--dcgm-exporter', type=str, default=None,
                         help='dcgm-exporter metrics URL to import DCGM '
                              'profiling metrics from')
@@ -69,6 +74,7 @@ def main():
             health_port=args.health_port,
             health_path=args.health_path,
             health_host=args.health_host,
+            engine=args.engine,
             dcgm_exporter_url=args.dcgm_exporter,
             listen_host=args.listen_host,
             listen_port=args.listen_port,

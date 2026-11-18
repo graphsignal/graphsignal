@@ -41,6 +41,7 @@ class VllmLaunchTest(unittest.TestCase):
             ['/abs/exec', 'serve', 'm'],
             metrics_port=8000,
             health_port=8000, health_path='/health', health_host='127.0.0.1',
+            engine='vllm',
             dcgm_exporter_url=None, listen_host=None, listen_port=18300)
 
     def test_launch_passes_argv_unchanged_except_disable_log_stats(self):
@@ -53,6 +54,7 @@ class VllmLaunchTest(unittest.TestCase):
             ['/abs/exec', 'serve', 'm', '--dtype', 'auto'],
             metrics_port=8000,
             health_port=8000, health_path='/health', health_host='127.0.0.1',
+            engine='vllm',
             dcgm_exporter_url=None, listen_host=None, listen_port=None)
         self.assertNotIn('--disable-log-stats', fx.launched_argv)
         self.assertNotIn('--otlp-traces-endpoint', fx.launched_argv)
@@ -65,6 +67,7 @@ class VllmLaunchTest(unittest.TestCase):
             ['/abs/exec', 'serve', 'm', '--port', '8001'],
             metrics_port=8001,
             health_port=8001, health_path='/health', health_host='127.0.0.1',
+            engine='vllm',
             dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_launch_explicit_metrics_port_overrides_engine_args(self):
@@ -76,6 +79,7 @@ class VllmLaunchTest(unittest.TestCase):
             ['/abs/exec', 'serve', 'm', '--port', '8001'],
             metrics_port=9999,
             health_port=8001, health_path='/health', health_host='127.0.0.1',
+            engine='vllm',
             dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_launch_health_host_from_engine_host(self):

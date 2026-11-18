@@ -59,6 +59,7 @@ class SglangLaunchTest(unittest.TestCase):
             ['/abs/exec', 'serve', '--enable-metrics'],
             metrics_port=30000,
             health_port=30000, health_path='/ready,/ping', health_host='127.0.0.1',
+            engine='sglang',
             dcgm_exporter_url=None, listen_host=None, listen_port=18301)
         self.assertNotIn('--enable-trace', fx.launched_argv)
         self.assertNotIn('--otlp-traces-endpoint', fx.launched_argv)
@@ -71,6 +72,7 @@ class SglangLaunchTest(unittest.TestCase):
             ['/abs/exec', 'serve', '--port', '30001', '--enable-metrics'],
             metrics_port=30001,
             health_port=30001, health_path='/ready,/ping', health_host='127.0.0.1',
+            engine='sglang',
             dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_launch_explicit_metrics_port_overrides_engine_args(self):
@@ -82,6 +84,7 @@ class SglangLaunchTest(unittest.TestCase):
             ['/abs/exec', 'serve', '--port', '30001', '--enable-metrics'],
             metrics_port=9999,
             health_port=30001, health_path='/ready,/ping', health_host='127.0.0.1',
+            engine='sglang',
             dcgm_exporter_url=None, listen_host=None, listen_port=None)
 
     def test_launch_raises_when_executable_missing(self):

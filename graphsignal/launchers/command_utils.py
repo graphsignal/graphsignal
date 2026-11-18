@@ -125,6 +125,7 @@ def start_watcher(pid: int,
                   health_port: Optional[int] = None,
                   health_path: Optional[str] = None,
                   health_host: Optional[str] = None,
+                  engine: Optional[str] = None,
                   dcgm_exporter_url: Optional[str] = None,
                   listen_host: Optional[str] = None,
                   listen_port: Optional[int] = None,
@@ -150,6 +151,8 @@ def start_watcher(pid: int,
         cmd.extend(['--health-path', str(health_path)])
     if health_host is not None:
         cmd.extend(['--health-host', str(health_host)])
+    if engine is not None:
+        cmd.extend(['--engine', str(engine)])
     if dcgm_exporter_url is not None:
         cmd.extend(['--dcgm-exporter', str(dcgm_exporter_url)])
     if listen_host is not None:
