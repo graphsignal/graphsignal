@@ -21,6 +21,8 @@ DEFAULT_SERVE_PORT = 30000
 # Releases without /ready (0.5.10 has none) answer 404; the probe then falls
 # back to /ping, which only says the HTTP server is up.
 HEALTH_PATH = '/ready,/ping'
+# Names the engine to the watcher: a key of recorders/engine_specs.py.
+ENGINE = 'sglang'
 
 
 class SglangLauncher(BaseLauncher):
@@ -55,6 +57,7 @@ class SglangLauncher(BaseLauncher):
                           health_port=extract_port(self.args, default=DEFAULT_SERVE_PORT),
                           health_path=HEALTH_PATH,
                           health_host=resolve_probe_host(self.args),
+                          engine=ENGINE,
                           dcgm_exporter_url=self.dcgm_exporter_url,
                           listen_host=self.listen_host,
                           listen_port=self.listen_port)

@@ -4,7 +4,8 @@ import sys
 import time
 import unittest
 
-from graphsignal.watcher.pid_monitor import PidMonitor, redact_command_line
+from graphsignal.watcher.pid_monitor import (
+    CREDENTIAL_NAME_RE, PidMonitor, redact_command_line)
 
 
 class _RecordingListener:
@@ -125,6 +126,15 @@ class RedactCommandLineTest(unittest.TestCase):
         self.assertEqual(
             redact_command_line(['x', '--ssl-keyfile-password', 'pw', '--secret', 's']),
             'x --ssl-keyfile-password [redacted] --secret [redacted]')
+
+    def test_credential_names_match_as_keys(self):
+        # The same names, without the dashes, as an engine config's keys.
+        for name in ('api_key', 'admin_api_key', 'ssl_keyfile_password', 'hf_token',
+                     'access_key', 'secret', 'credentials'):
+            self.assertTrue(CREDENTIAL_NAME_RE.match(name), name)
+        for name in ('tokenizer_path', 'max_total_tokens', 'speculative_token_map',
+                     'ssl_keyfile', '--api-key'):
+            self.assertFalse(CREDENTIAL_NAME_RE.match(name), name)
 
     def test_other_flags_are_left_alone(self):
         argv = ['vllm', 'serve', 'm', '--max-tokens', '100', '--tokenizer', 'tok',

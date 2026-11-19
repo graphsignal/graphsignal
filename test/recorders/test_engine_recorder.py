@@ -1,6 +1,8 @@
+import json
 import os
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -8,7 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import graphsignal.watcher
-from graphsignal.recorders.engine_recorder import EngineRecorder, _HealthTimes
+import graphsignal.recorders.log_recorder as log_recorder_mod
+from graphsignal.recorders.engine_recorder import (
+    EngineRecorder, _HealthTimes, build_engine_resource, parse_config_line,
+    redact_engine_info)
 from test.http_server import HttpTestServer
 from test.test_utils import configure_test_watcher, find_metric
 
@@ -471,6 +476,376 @@ class EngineRecorderHealthTest(unittest.TestCase):
     def test_probe_connection_refused_is_unhealthy(self):
         recorder = self._recorder(health_port=_free_port())
         self.assertFalse(recorder._probe_health())
+
+
+# vLLM's cache settings as an info gauge; a second data-parallel engine's
+# series follows, which is not kept.
+_CONFIG_INFO_BODY = """# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig
+# TYPE vllm:cache_config_info gauge
+vllm:cache_config_info{block_size="16",enable_prefix_caching="True",engine="%(engine)s",long_label="%(long)s"} 1.0
+"""
+_CONFIG_INFO_BODY_SECOND = """vllm:cache_config_info{block_size="16",enable_prefix_caching="True",engine="1",long_label="other"} 1.0
+"""
+
+# vLLM 0.19's start-up line, trimmed, with each kind of value it prints.
+_VLLM_CONFIG_LINE = (
+    "(EngineCore pid=1985) INFO 11-17 15:48:23 [core.py:105] Initializing a V1 LLM "
+    "engine (v0.19.0+6bc3197f) with config: model='Qwen/Qwen2.5-0.5B-Instruct', "
+    "speculative_config=None, dtype=torch.bfloat16, max_seq_len=32768, "
+    "tensor_parallel_size=1, enforce_eager=False, kv_cache_dtype=auto, "
+    "structured_outputs_config=StructuredOutputsConfig(backend='auto', "
+    "reasoning_parser='', enable_in_reasoning=False), seed=0, "
+    "served_model_name=Qwen/Qwen2.5-0.5B-Instruct, enable_prefix_caching=True, "
+    "compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, "
+    "'custom_ops': ['none'], 'cache_dir': ''}")
+_MARKER = ' with config: '
+
+
+class ParseConfigLineTest(unittest.TestCase):
+    def test_vllm_line(self):
+        fields = parse_config_line(_VLLM_CONFIG_LINE.split(_MARKER, 1)[1])
+        self.assertEqual(fields['model'], 'Qwen/Qwen2.5-0.5B-Instruct')
+        self.assertIsNone(fields['speculative_config'])
+        self.assertEqual(fields['dtype'], 'torch.bfloat16')
+        self.assertEqual(fields['max_seq_len'], 32768)
+        self.assertEqual(fields['tensor_parallel_size'], 1)
+        self.assertIs(fields['enforce_eager'], False)
+        self.assertIs(fields['enable_prefix_caching'], True)
+        self.assertEqual(fields['served_model_name'], 'Qwen/Qwen2.5-0.5B-Instruct')
+        # Nested reprs stay whole, commas and all.
+        self.assertEqual(fields['structured_outputs_config'],
+                         "StructuredOutputsConfig(backend='auto', reasoning_parser='', "
+                         "enable_in_reasoning=False)")
+        self.assertEqual(fields['compilation_config'],
+                         "{'mode': <CompilationMode.VLLM_COMPILE: 3>, "
+                         "'custom_ops': ['none'], 'cache_dir': ''}")
+        self.assertEqual(len(fields), 12)
+
+    def test_comma_inside_a_quoted_value(self):
+        self.assertEqual(parse_config_line("a='x, b=1', c=2"), {'a': 'x, b=1', 'c': 2})
+
+    def test_floats_and_empty(self):
+        self.assertEqual(parse_config_line("u=0.9, e=, s=''"), {'u': 0.9, 'e': '', 's': ''})
+
+
+# A trimmed SGLang /get_server_info answer, with every kind of secret planted.
+_SGLANG_INFO = {
+    'version': '0.5.10+516d57ac',
+    'model_path': 'Qwen/Qwen2.5-0.5B-Instruct',
+    'tokenizer_path': 'Qwen/Qwen2.5-0.5B-Instruct',
+    'max_running_requests': 8,
+    'max_total_tokens': None,
+    'disable_radix_cache': False,
+    'api_key': 'sk-live-123',
+    'admin_api_key': None,
+    'ssl_keyfile_password': 'hunter2',
+    'hf_token': '',
+    'encoder_urls': ['https://user:pass@encoder.internal/v1'],
+    'mm_process_config': {'access_key': 'AKIA123', 'image': {'max_pixels': 1024}},
+    'internal_states': [{'last_gen_throughput': 12.5}],
+}
+
+
+class EngineResourceTest(unittest.TestCase):
+    def test_redacts_credentials_at_any_depth(self):
+        redacted = redact_engine_info(_SGLANG_INFO)
+        self.assertEqual(redacted['api_key'], '[redacted]')
+        self.assertEqual(redacted['ssl_keyfile_password'], '[redacted]')
+        self.assertEqual(redacted['mm_process_config']['access_key'], '[redacted]')
+        self.assertEqual(redacted['encoder_urls'],
+                         ['https://[redacted]@encoder.internal/v1'])
+        # Unset is configuration, not a secret.
+        self.assertIsNone(redacted['admin_api_key'])
+        self.assertEqual(redacted['hf_token'], '')
+        # Names that only contain a credential word are left alone.
+        self.assertEqual(redacted['tokenizer_path'], 'Qwen/Qwen2.5-0.5B-Instruct')
+        self.assertIsNone(redacted['max_total_tokens'])
+        self.assertEqual(redacted['mm_process_config']['image'], {'max_pixels': 1024})
+
+    def test_no_secret_reaches_the_payload(self):
+        _tags, attributes = build_engine_resource('sglang', _SGLANG_INFO)
+        payload = attributes['engine.config']
+        for secret in ('sk-live-123', 'hunter2', 'AKIA123', 'user:pass'):
+            self.assertNotIn(secret, payload)
+
+    def test_tags_and_payload(self):
+        tags, attributes = build_engine_resource('sglang', _SGLANG_INFO)
+        self.assertEqual(tags, {'engine.name': 'sglang', 'engine.version': '0.5.10+516d57ac'})
+        config = json.loads(attributes['engine.config'])
+        self.assertEqual(config['max_running_requests'], 8)
+        # Runtime state is not configuration.
+        self.assertNotIn('internal_states', config)
+
+    def test_payload_ignores_key_order_and_runtime_state(self):
+        reordered = dict(reversed(list(_SGLANG_INFO.items())))
+        reordered['internal_states'] = [{'last_gen_throughput': 99.0}]
+        self.assertEqual(build_engine_resource('sglang', _SGLANG_INFO),
+                         build_engine_resource('sglang', reordered))
+
+    def test_identity_survives_a_config_change(self):
+        # Tags are the resource's identity: a restart on new flags (or with a
+        # new seed and KV pool) replaces the configuration, never adds a resource.
+        changed = dict(_SGLANG_INFO, max_running_requests=64, random_seed=12345)
+        before, after = (build_engine_resource('sglang', _SGLANG_INFO),
+                         build_engine_resource('sglang', changed))
+        self.assertEqual(before[0], after[0])
+        self.assertNotEqual(before[1], after[1])
+
+    def test_version_only_answer(self):
+        # vLLM's /version.
+        tags, attributes = build_engine_resource('vllm', {'version': '0.11.0'})
+        self.assertEqual(tags['engine.version'], '0.11.0')
+        self.assertEqual(attributes['engine.config'], '{"version":"0.11.0"}')
+
+    def test_non_object_answer_is_none(self):
+        self.assertIsNone(build_engine_resource('sglang', ['not', 'an', 'object']))
+
+    def test_config_info_labels_join_the_config(self):
+        labels = {'gpu_memory_utilization': '0.9', 'enable_prefix_caching': 'True',
+                  'hf_token': 'hf_live'}
+        _tags, attributes = build_engine_resource(
+            'vllm', {'version': '0.19.0'}, {'vllm:cache_config_info': labels})
+        config = json.loads(attributes['engine.config'])
+        self.assertEqual(config['vllm:cache_config_info']['gpu_memory_utilization'], '0.9')
+        # Labels are redacted like the rest of the configuration.
+        self.assertEqual(config['vllm:cache_config_info']['hf_token'], '[redacted]')
+
+
+class EngineRecorderInfoTest(unittest.TestCase):
+    def setUp(self):
+        self.watcher = configure_test_watcher()
+        self.now_ns = 0
+
+    def tearDown(self):
+        graphsignal.watcher.shutdown()
+
+    def _server(self, routes):
+        """GET <path> answers routes[path] as (status, body); 404 otherwise."""
+        requested = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requested.append(self.path)
+                status, body = routes.get(self.path, (404, b''))
+                self.send_response(status)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1], requested
+
+    def _recorder(self, port, **kwargs):
+        kwargs.setdefault('engine', 'sglang')
+        return EngineRecorder(root_pid=123, pid=123, health_port=port,
+                              clock_ns=lambda: self.now_ns, **kwargs)
+
+    def _engine_resources(self):
+        return [r for r in self.watcher.resource_store().export()
+                if r['kind'] == 'engine']
+
+    def test_info_url_from_the_engine_spec(self):
+        self.assertEqual(self._recorder(30000)._engine_info_url,
+                         'http://127.0.0.1:30000/get_server_info')
+        vllm = self._recorder(8000, engine='vllm')
+        self.assertEqual(vllm._engine_info_url, 'http://127.0.0.1:8000/version')
+        self.assertEqual(vllm._config_line_marker, _MARKER)
+
+    def test_no_engine_or_unlisted_engine_no_url(self):
+        for engine in (None, 'trtllm'):
+            recorder = self._recorder(8000, engine=engine)
+            self.assertIsNone(recorder._engine_info_url)
+            self.assertIsNone(recorder._config_line_marker)
+            # Nothing to fetch: a healthy probe records no resource.
+            recorder._record_engine_resource()
+        self.assertEqual(self._engine_resources(), [])
+
+    def test_records_engine_resource_whole(self):
+        info = dict(_SGLANG_INFO, padding='x' * 5000)
+        port, requested = self._server(
+            {'/get_server_info': (200, json.dumps(info).encode())})
+        recorder = self._recorder(port)
+        recorder._record_engine_resource()
+
+        resources = self._engine_resources()
+        self.assertEqual(len(resources), 1)
+        resource = resources[0]
+        self.assertEqual(resource['tags']['engine.name'], 'sglang')
+        self.assertEqual(resource['tags']['engine.version'], '0.5.10+516d57ac')
+        config = json.loads(resource['attributes']['engine.config'])
+        # Over the generic attribute cap, and stored whole.
+        self.assertEqual(len(config['padding']), 5000)
+        self.assertEqual(config['api_key'], '[redacted]')
+        self.assertEqual(requested, ['/get_server_info'])
+
+    def test_fetches_once_and_refreshes_on_period(self):
+        port, requested = self._server(
+            {'/get_server_info': (200, json.dumps(_SGLANG_INFO).encode())})
+        recorder = self._recorder(port, engine_info_refresh_sec=60)
+        recorder._record_engine_resource()
+        first_seen = self._engine_resources()[0]['last_seen_ts']
+
+        self.now_ns = int(30e9)
+        recorder._record_engine_resource()
+        self.assertEqual(self._engine_resources()[0]['last_seen_ts'], first_seen)
+
+        self.now_ns = int(61e9)
+        time.sleep(0.001)
+        recorder._record_engine_resource()
+        self.assertGreater(self._engine_resources()[0]['last_seen_ts'], first_seen)
+        # Re-recorded from what was fetched, never fetched again.
+        self.assertEqual(requested, ['/get_server_info'])
+
+    def test_4xx_ends_attempts(self):
+        port, requested = self._server({'/get_server_info': (401, b'')})
+        recorder = self._recorder(port)
+        recorder._record_engine_resource()
+        recorder._record_engine_resource()
+        self.assertEqual(requested, ['/get_server_info'])
+        self.assertEqual(self._engine_resources(), [])
+
+    def test_5xx_retries_on_next_healthy_probe(self):
+        routes = {'/get_server_info': (503, b'')}
+        port, requested = self._server(routes)
+        recorder = self._recorder(port)
+        recorder._record_engine_resource()
+        self.assertEqual(self._engine_resources(), [])
+
+        routes['/get_server_info'] = (200, json.dumps(_SGLANG_INFO).encode())
+        recorder._record_engine_resource()
+        self.assertEqual(len(self._engine_resources()), 1)
+        self.assertEqual(requested, ['/get_server_info', '/get_server_info'])
+
+    def test_non_json_answer_ends_attempts(self):
+        port, requested = self._server({'/get_server_info': (200, b'<html>')})
+        recorder = self._recorder(port)
+        recorder._record_engine_resource()
+        recorder._record_engine_resource()
+        self.assertEqual(requested, ['/get_server_info'])
+        self.assertEqual(self._engine_resources(), [])
+
+    def _scrape(self, recorder, body):
+        recorder._scraper._next_attempt_ts = 0
+        with patch.object(recorder._scraper, '_fetch', return_value=body):
+            recorder.on_tick()
+
+    def test_scrape_keeps_config_info_labels_whole(self):
+        long_value = 'x' * 400
+        recorder = self._recorder(8000, metrics_port=8000)
+        self._scrape(recorder, _CONFIG_INFO_BODY % {'engine': '0', 'long': long_value}
+                     + _CONFIG_INFO_BODY_SECOND)
+        self.assertEqual(recorder._config_info, {'vllm:cache_config_info': {
+            'block_size': '16', 'enable_prefix_caching': 'True', 'engine': '0',
+            'long_label': long_value}})
+        self.assertTrue(recorder._config_info_scraped)
+
+    def test_waits_for_the_first_scrape(self):
+        port, requested = self._server(
+            {'/version': (200, b'{"version": "0.19.0"}')})
+        # The start-up line is already printed: only the scrape is waited for.
+        self._console(123, [_VLLM_CONFIG_LINE])
+        recorder = self._recorder(port, engine='vllm', metrics_port=port)
+        recorder._record_engine_resource()
+        self.assertEqual(self._engine_resources(), [])
+
+        self._scrape(recorder, _CONFIG_INFO_BODY % {'engine': '0', 'long': 'v'})
+        recorder._record_engine_resource()
+        resources = self._engine_resources()
+        self.assertEqual(len(resources), 1)
+        config = json.loads(resources[0]['attributes']['engine.config'])
+        self.assertEqual(config['version'], '0.19.0')
+        self.assertEqual(config['vllm:cache_config_info']['block_size'], '16')
+        # The info answer is fetched once, whatever the wait.
+        self.assertEqual(requested, ['/version'])
+
+    def test_records_without_config_info_past_the_wait(self):
+        port, _requested = self._server(
+            {'/version': (200, b'{"version": "0.19.0"}')})
+        # The start-up line is already printed: only the scrape is missing.
+        self._console(123, [_VLLM_CONFIG_LINE])
+        recorder = self._recorder(port, engine='vllm', metrics_port=port,
+                                  engine_config_info_wait_sec=60)
+        recorder._record_engine_resource()
+        self.now_ns = int(59e9)
+        recorder._record_engine_resource()
+        self.assertEqual(self._engine_resources(), [])
+
+        self.now_ns = int(60e9)
+        recorder._record_engine_resource()
+        config = json.loads(self._engine_resources()[0]['attributes']['engine.config'])
+        self.assertEqual(set(config), {'version', 'startup_config'})
+
+    def _console(self, pid, lines):
+        """Console segments as the supervisor writes them, under a temp base."""
+        # addCleanup rather than enterContext, which needs Python 3.11.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = tmp.name
+        shm_base = patch.object(log_recorder_mod, '_SHM_BASE', base)
+        shm_base.start()
+        self.addCleanup(shm_base.stop)
+        log_dir = os.path.join(base, f'graphsignal_log_{pid}')
+        os.mkdir(log_dir)
+        path = os.path.join(log_dir, 'log_0.jsonl')
+
+        def write(more):
+            with open(path, 'a') as f:
+                for line in more:
+                    f.write(json.dumps({'ts': 1, 'stream': 'stdout', 'line': line}) + '\n')
+        write(lines)
+        return write
+
+    def test_startup_config_joins_the_config(self):
+        port, _requested = self._server({'/version': (200, b'{"version": "0.19.0"}')})
+        self._console(123, ['INFO starting', _VLLM_CONFIG_LINE, 'INFO ready'])
+        recorder = self._recorder(port, engine='vllm')
+        recorder._record_engine_resource()
+        config = json.loads(self._engine_resources()[0]['attributes']['engine.config'])
+        self.assertEqual(config['version'], '0.19.0')
+        self.assertEqual(config['startup_config']['max_seq_len'], 32768)
+        self.assertEqual(config['startup_config']['tensor_parallel_size'], 1)
+
+    def test_waits_for_the_startup_line(self):
+        port, _requested = self._server({'/version': (200, b'{"version": "0.19.0"}')})
+        write = self._console(123, ['INFO starting'])
+        recorder = self._recorder(port, engine='vllm')
+        recorder._record_engine_resource()
+        self.assertEqual(self._engine_resources(), [])
+
+        write(['INFO loading', _VLLM_CONFIG_LINE])
+        recorder._record_engine_resource()
+        config = json.loads(self._engine_resources()[0]['attributes']['engine.config'])
+        self.assertEqual(config['startup_config']['dtype'], 'torch.bfloat16')
+
+    def test_records_without_startup_line_past_the_wait(self):
+        port, _requested = self._server({'/version': (200, b'{"version": "0.19.0"}')})
+        recorder = self._recorder(port, engine='vllm',
+                                  engine_config_info_wait_sec=60)
+        # No console directory at all: a target not started by graphsignal-run.
+        with patch.object(log_recorder_mod, '_SHM_BASE', '/nonexistent-graphsignal-test'):
+            recorder._record_engine_resource()
+            self.assertEqual(self._engine_resources(), [])
+            self.now_ns = int(60e9)
+            recorder._record_engine_resource()
+        config = json.loads(self._engine_resources()[0]['attributes']['engine.config'])
+        self.assertEqual(config, {'version': '0.19.0'})
+
+    def test_recorded_after_a_healthy_probe_only(self):
+        port, requested = self._server(
+            {'/get_server_info': (200, json.dumps(_SGLANG_INFO).encode())})
+        recorder = self._recorder(port, health_interval_sec=0.01)
+        self.addCleanup(recorder.shutdown)
+        with patch.object(recorder, '_probe_health', return_value=False):
+            recorder.setup()
+            time.sleep(0.1)
+            self.assertEqual(requested, [])
+        with patch.object(recorder, '_probe_health', return_value=True):
+            self.assertTrue(_wait_for(lambda: self._engine_resources()))
 
 
 if __name__ == '__main__':

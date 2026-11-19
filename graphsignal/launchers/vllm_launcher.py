@@ -14,6 +14,8 @@ logger = logging.getLogger('graphsignal')
 DEFAULT_SERVE_PORT = 8000
 # Checks local engine-dead flags only: no engine RPC, no GPU work.
 HEALTH_PATH = '/health'
+# Names the engine to the watcher: a key of recorders/engine_specs.py.
+ENGINE = 'vllm'
 
 
 class VllmLauncher(BaseLauncher):
@@ -41,6 +43,7 @@ class VllmLauncher(BaseLauncher):
                           health_port=extract_port(self.args, default=DEFAULT_SERVE_PORT),
                           health_path=HEALTH_PATH,
                           health_host=resolve_probe_host(self.args),
+                          engine=ENGINE,
                           dcgm_exporter_url=self.dcgm_exporter_url,
                           listen_host=self.listen_host,
                           listen_port=self.listen_port)

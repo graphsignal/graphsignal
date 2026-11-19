@@ -160,6 +160,13 @@ class StartWatcherTest(unittest.TestCase):
             cmd[5:], ['--health-port', '8000', '--health-path', '/ready',
                       '--health-host', '10.0.0.5'])
 
+    def test_spawn_args_with_engine(self):
+        with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
+            start_watcher(54321, health_port=30000, engine='sglang')
+        cmd = popen_m.call_args[0][0]
+        self.assertEqual(
+            cmd[5:], ['--health-port', '30000', '--engine', 'sglang'])
+
     def test_spawn_args_with_dcgm_exporter(self):
         with patch.object(subprocess, 'Popen', return_value=MagicMock()) as popen_m:
             start_watcher(54321, dcgm_exporter_url='http://10.0.0.7:9400/metrics')
